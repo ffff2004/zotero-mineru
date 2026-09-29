@@ -1,0 +1,4 @@
+# Official PyPI distributions, Linux x86_64, CPython 3.13.12.
+# MinerU's published torch extra supplies its NVIDIA-capable PyTorch stack.
+mineru[torch]==4.0.10
+docvortex==0.5.7
