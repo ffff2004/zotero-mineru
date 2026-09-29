@@ -203,15 +203,13 @@ vim .env
 
     Si vous développez plus d'une extension, vous pouvez stocker le chemin bin et le chemin profile dans les variables d'environnement du système, qui peuvent être omises ici.
 
-3. Installez les dépendances avec `npm install`
+3. Installez Node.js 24 et la version de pnpm indiquée dans `package.json`, puis installez les dépendances avec `pnpm install --frozen-lockfile`
 
-   > Si vous utilisez `pnpm` comme gestionnaire de paquets pour votre projet, vous devez ajouter `public-hoist-pattern[]=*@types/bluebird*` à `.npmrc`, voir <https://github.com/windingwind/zotero-types?tab=readme-ov-file#usage>.
-
-   Si vous obtenez `npm ERR ! ERESOLVE unable to resolve dependency tree` avec `npm install`, qui est un bogue de dépendance en amont de typescript-eslint, utilisez la commande `npm i -f` pour l'installer.
+   > `pnpm-workspace.yaml` contient la configuration de hoisting requise par `zotero-types` et fixe sa dépendance Git PDF.js au commit d’origine. La préparation de la dépendance Git appelle npm en interne ; l’installation de Node.js doit donc aussi inclure npm.
 
 ### 3. Codez
 
-Démarrez le serveur de développement avec `npm start`:
+Démarrez le serveur de développement avec `pnpm start`:
 
 - Il fera La pré-construction de l'extension en mode développement
 - Il démarrera Zotero avec l'extension chargée depuis `build/`
@@ -223,7 +221,7 @@ Démarrez le serveur de développement avec `npm start`:
 
 Fatigué des redémarrages incessants ? Oubliez-les !
 
-1. Lancez `npm start`.
+1. Lancez `pnpm start`.
 2. Coder. (Oui, c'est tout)
 
 Lorsque des changements de fichiers sont détectés dans `src` ou `addon`, l'extension 'sera automatiquement compilé et rechargé.
@@ -246,7 +244,7 @@ Vous pouvez également :
 
 ### 4. Construction (Build)
 
-Exécutez `npm run build` construire l'extension en mode production : t le xpi pour l'installation et le code construit se trouve dans le dossier `build`.
+Exécutez `pnpm run build` construire l'extension en mode production : t le xpi pour l'installation et le code construit se trouve dans le dossier `build`.
 
 Étapes de la construction :
 
@@ -275,12 +273,12 @@ pour construire et produire une Release, utilisez :
 
 ```shell
 # version increase, git add, commit and push
-# then on ci, npm run build, and release to GitHub
-npm run release
+# then on ci, pnpm run build, and release to GitHub
+pnpm run release
 ```
 
 > [!NOTE]
-> Cela utilisera [Bumpp](https://github.com/antfu-collective/bumpp) pour saisir le nouveau numéro de version, modifier localement la version, exécuter tous les scripts (pré/post) version définis dans `package.json`, commit, build (optionnel), marquer le commit avec le numéro de version et pousser les commits et les tags git. Bumpp peut être configuré dans `zotero-plugin-config.ts` ; par exemple, ajoutez `release : { bumpp : { execute : « npm run build » } }` pour construire également avant de commiter.
+> Cela utilisera [Bumpp](https://github.com/antfu-collective/bumpp) pour saisir le nouveau numéro de version, modifier localement la version, exécuter tous les scripts (pré/post) version définis dans `package.json`, commit, build (optionnel), marquer le commit avec le numéro de version et pousser les commits et les tags git. Bumpp peut être configuré dans `zotero-plugin-config.ts` ; par exemple, ajoutez `release : { bumpp : { execute : « pnpm run build » } }` pour construire également avant de commiter.
 > Par la suite, GitHub Action reconstruira l'extensions et utilisera le script `release` de `zotero-plugin-scaffold` pour publier l'XPI sur GitHub Release. De plus, une version séparée (tag : `release`) sera créée ou mise à jour qui inclura les manifestes de mise à jour `update.json` et `update-beta.json` en tant qu'actifs. Ceux-ci seront disponibles à `https://github.com/{{owner}}/{{repo}}/releases/download/release/update*.json`.
 
 #### À propos des pré-releases
@@ -401,7 +399,8 @@ Cette section montre la structure des répertoires d'un modèle.
 |-- .prettierrc               # prettier conf, https://prettier.io/
 |-- eslint.config.mjs         # eslint conf, https://eslint.org/
 |-- LICENSE
-|-- package-lock.json
+|-- pnpm-lock.yaml
+|-- pnpm-workspace.yaml       # pnpm configuration
 |-- package.json
 |-- tsconfig.json             # typescript conf, https://code.visualstudio.com/docs/languages/jsconfig
 |-- README.md

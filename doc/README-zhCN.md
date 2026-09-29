@@ -198,15 +198,13 @@ Obsidian 风格的指令输入模块，它通过接受文本来运行插件，�
 
    如果你维护了多个插件，可以将这些内容存入系统环境变量，以避免在每个插件中都需要重复设置。
 
-3. 运行 `npm install` 以安装相关依赖
+3. 安装 Node.js 24 和 `package.json` 指定版本的 pnpm，然后运行 `pnpm install --frozen-lockfile` 安装依赖
 
-   > 如果你使用 `pnpm` 作为包管理器，你需要添加 `public-hoist-pattern[]=*@types/bluebird*` 到`.npmrc`, 详情请查看 [zotero-types](https://github.com/windingwind/zotero-types?tab=readme-ov-file#usage) 的文档。
-
-   如果你使用 `npm install` 的过程中遇到了 `npm ERR! ERESOLVE unable to resolve dependency tree` ，这是由于上游依赖 typescript-eslint 导致的错误，请使用 `npm i -f` 命令进行安装。
+   > `pnpm-workspace.yaml` 已包含 `zotero-types` 所需的 hoisting 配置，并将其 PDF.js Git 依赖固定在原锁文件的 commit。 该 Git 依赖的 prepare 会由 pnpm 内部调用 npm，因此 Node.js 环境也需要提供 npm。
 
 ### 3 开发插件
 
-使用 `npm start` 启动开发服务器，它将：
+使用 `pnpm start` 启动开发服务器，它将：
 
 - 在开发模式下预构建插件
 - 启动 Zotero，并让其从 `build/` 中加载插件
@@ -217,7 +215,7 @@ Obsidian 风格的指令输入模块，它通过接受文本来运行插件，�
 
 厌倦了无休止的重启吗？忘掉它，拥抱热加载！
 
-1. 运行 `npm start`.
+1. 运行 `pnpm start`.
 2. 编码。(是的，就这么简单)
 
 当检测到 `src` 或 `addon` 中的文件修改时，插件将自动编译并重新加载。
@@ -243,7 +241,7 @@ Obsidian 风格的指令输入模块，它通过接受文本来运行插件，�
 
 ### 4 构建插件
 
-运行 `npm run build` 在生产模式下构建插件，构建的结果位于 `.scaffold/build/` 目录中。
+运行 `pnpm run build` 在生产模式下构建插件，构建的结果位于 `.scaffold/build/` 目录中。
 
 构建步骤文档可参阅 [zotero-plugin-scaffold](https://northword.github.io/zotero-plugin-scaffold/build.html)简单来说，可以分为以下几步：
 
@@ -273,8 +271,8 @@ Obsidian 风格的指令输入模块，它通过接受文本来运行插件，�
 
 ```shell
 # version increase, git add, commit and push
-# then on ci, npm run build, and release to GitHub
-npm run release
+# then on ci, pnpm run build, and release to GitHub
+pnpm run release
 ```
 
 > [!note]
@@ -396,7 +394,8 @@ Zotero 文档已过时且不完整，克隆 <https://github.com/zotero/zotero> �
 |-- .prettierrc               # prettier conf, https://prettier.io/
 |-- eslint.config.mjs         # eslint conf, https://eslint.org/
 |-- LICENSE
-|-- package-lock.json
+|-- pnpm-lock.yaml
+|-- pnpm-workspace.yaml       # pnpm configuration
 |-- package.json
 |-- tsconfig.json             # typescript conf, https://code.visualstudio.com/docs/languages/jsconfig
 |-- README.md

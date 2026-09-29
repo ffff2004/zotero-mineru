@@ -2,6 +2,7 @@
   "name": "zotero-plugin-template",
   "type": "module",
   "version": "3.1.0",
+  "packageManager": "pnpm@11.25.0",
   "description": "Zotero Plugin Template",
   "config": {
     "addonName": "Zotero Plugin Template",
@@ -27,7 +28,7 @@
     "lint:fix": "prettier --write . && eslint . --fix",
     "release": "zotero-plugin release",
     "test": "zotero-plugin test",
-    "update-deps": "npm update --save"
+    "update-deps": "pnpm update"
   },
   "dependencies": {
     "zotero-plugin-toolkit": "^5.1.0-beta.13"

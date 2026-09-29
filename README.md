@@ -200,15 +200,13 @@ Activate with `Shift+P`.
 
    If you are developing more than one plugin, you can store the bin path and profile path in the system environment variables, which can be omitted here.
 
-3. Install dependencies with `npm install`
+3. Install Node.js 24 and the pnpm version specified in `package.json`, then install dependencies with `pnpm install --frozen-lockfile`
 
-   > If you are using `pnpm` as the package manager for your project, you need to add `public-hoist-pattern[]=*@types/bluebird*` to `.npmrc`, see <https://github.com/windingwind/zotero-types?tab=readme-ov-file#usage>.
-
-   If you get `npm ERR! ERESOLVE unable to resolve dependency tree` with `npm install`, which is an upstream dependency bug of typescript-eslint, use the `npm i -f` command to install it.
+   > `pnpm-workspace.yaml` includes the hoisting configuration required by `zotero-types` and pins its PDF.js Git dependency to the original commit. Preparing the Git dependency invokes npm internally, so the Node.js installation must also include npm.
 
 ### 3 Coding
 
-Start development server with `npm start`, it will:
+Start development server with `pnpm start`, it will:
 
 - Prebuild the plugin in development mode
 - Start Zotero with plugin loaded from `build/`
@@ -218,7 +216,7 @@ Start development server with `npm start`, it will:
 
 Tired of endless restarting? Forget about it!
 
-1. Run `npm start`.
+1. Run `pnpm start`.
 2. Coding. (Yes, that's all)
 
 When file changes are detected in `src` or `addon`, the plugin will be automatically compiled and reloaded.
@@ -241,7 +239,7 @@ You can also:
 
 ### 4 Build
 
-Run `npm run build` to build the plugin in production mode. The build output will be located in the `.scaffold/build/` directory.
+Run `pnpm run build` to build the plugin in production mode. The build output will be located in the `.scaffold/build/` directory.
 
 For detailed build steps, refer to the [zotero-plugin-scaffold documentation](https://northword.github.io/zotero-plugin-scaffold/build.html). In short, the process can be divided into the following steps:
 
@@ -271,12 +269,12 @@ To build and release, use
 
 ```shell
 # version increase, git add, commit and push
-# then on ci, npm run build, and release to GitHub
-npm run release
+# then on ci, pnpm run build, and release to GitHub
+pnpm run release
 ```
 
 > [!note]
-> This will use [Bumpp](https://github.com/antfu-collective/bumpp) to prompt for the new version number, locally bump the version, run any (pre/post)version scripts defined in `package.json`, commit, build (optional), tag the commit with the version number and push commits and git tags. Bumpp can be configured in `zotero-plugin-config.ts`; for example, add `release: { bumpp: { execute: "npm run build" } }` to also build before committing.
+> This will use [Bumpp](https://github.com/antfu-collective/bumpp) to prompt for the new version number, locally bump the version, run any (pre/post)version scripts defined in `package.json`, commit, build (optional), tag the commit with the version number and push commits and git tags. Bumpp can be configured in `zotero-plugin-config.ts`; for example, add `release: { bumpp: { execute: "pnpm run build" } }` to also build before committing.
 >
 > Subsequently GitHub Action will rebuild the plugin and use `zotero-plugin-scaffold`'s `release` script to publish the XPI to GitHub Release. In addition, a separate release (tag: `release`) will be created or updated that includes update manifests `update.json` and `update-beta.json` as assets. These will be available at `https://github.com/{{owner}}/{{repo}}/releases/download/release/update*.json`.
 
@@ -398,7 +396,8 @@ This section shows the directory structure of a template.
 |-- .prettierrc               # prettier conf, https://prettier.io/
 |-- eslint.config.mjs         # eslint conf, https://eslint.org/
 |-- LICENSE
-|-- package-lock.json
+|-- pnpm-lock.yaml
+|-- pnpm-workspace.yaml       # pnpm configuration
 |-- package.json
 |-- tsconfig.json             # typescript conf, https://code.visualstudio.com/docs/languages/jsconfig
 |-- README.md

@@ -8,14 +8,14 @@
       "type": "node",
       "request": "launch",
       "name": "Start",
-      "runtimeExecutable": "npm",
+      "runtimeExecutable": "pnpm",
       "runtimeArgs": ["run", "start"]
     },
     {
       "type": "node",
       "request": "launch",
       "name": "Build",
-      "runtimeExecutable": "npm",
+      "runtimeExecutable": "pnpm",
       "runtimeArgs": ["run", "build"]
     }
   ]

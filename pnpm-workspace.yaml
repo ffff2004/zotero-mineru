@@ -1,0 +1,16 @@
+publicHoistPattern:
+  - "*@types/bluebird*"
+
+allowBuilds:
+  "@swc/core": true
+  es5-ext: false
+  esbuild: true
+  pdfjs-dist@https://codeload.github.com/zotero-plugin-dev/zotero-pdfjs-types/tar.gz/8aa68e6e7936550ee557d530b074bc861f22247a: true
+
+# zotero-types uses GitHub-hosted dependencies instead of registry packages.
+blockExoticSubdeps: false
+
+# pnpm needs the full commit instead of the upstream shorthand.
+# Keep the commit from the npm lockfile and scope the override to this version.
+overrides:
+  "zotero-types@4.1.0-beta.4>pdfjs-dist": "https://github.com/zotero-plugin-dev/zotero-pdfjs-types.git#8aa68e6e7936550ee557d530b074bc861f22247a"
