@@ -33,6 +33,14 @@ export type PublicationRequest = {
   title?: string;
   /** Prevent a new publication after plugin shutdown. */
   signal?: AbortSignal;
+  /** Observed recovery only; the controller owns task diagnostics. */
+  onRecovery?: (event: {
+    event: "start" | "complete" | "error";
+    publicationError?: unknown;
+    error?: unknown;
+    outcome?: "committed" | "rolledBack";
+    kind?: "rollback" | "finalization";
+  }) => void;
 };
 
 export type RecoveryResult = { committed: number; rolledBack: number };
@@ -543,6 +551,14 @@ export async function publishValidatedPackage(
   } catch (error) {
     if (journal?.phase === "committed") {
       if (await IOUtils.exists(journalPath(journal.token)).catch(() => true)) {
+        request.onRecovery?.({
+          event: "error",
+          kind: "finalization",
+          publicationError: error,
+          error: new Error(
+            "Committed attachment journal finalization incomplete",
+          ),
+        });
         throw new PublicationRecoveryError(
           error,
           new Error("Committed attachment journal finalization incomplete"),
@@ -551,8 +567,13 @@ export async function publishValidatedPackage(
       }
     } else {
       try {
-        if (journal) await recoverOne(journal);
+        if (journal) {
+          request.onRecovery?.({ event: "start", publicationError: error });
+          const outcome = await recoverOne(journal);
+          request.onRecovery?.({ event: "complete", outcome });
+        }
       } catch (cleanupError) {
+        request.onRecovery?.({ event: "error", error: cleanupError });
         throw new PublicationRecoveryError(error, cleanupError);
       }
     }

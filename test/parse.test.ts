@@ -213,13 +213,14 @@ exit 3
       assert.instanceOf(failure, MineruTaskError);
       assert.equal((failure as MineruTaskError).category, "process");
       assert.equal((failure as MineruTaskError).message, "MinerU 解析失败");
-      assert.include(
+      assert.equal((failure as MineruTaskError).exitCode, 3);
+      assert.equal(
         await IOUtils.readUTF8((failure as MineruTaskError).logs!.stdout),
-        "success",
+        "success\n",
       );
-      assert.include(
+      assert.equal(
         await IOUtils.readUTF8((failure as MineruTaskError).logs!.stderr),
-        "diagnostic",
+        "diagnostic\n",
       );
     } finally {
       await IOUtils.remove(root.path, { recursive: true, ignoreAbsent: true });
@@ -316,6 +317,14 @@ exit 3
       }
       assert.instanceOf(failure, MineruTaskError);
       assert.equal((failure as MineruTaskError).category, "validation");
+      assert.equal(
+        await IOUtils.readUTF8((failure as MineruTaskError).logs!.stderr),
+        "",
+      );
+      assert.include(
+        String((failure as MineruTaskError).cause),
+        "Missing asset",
+      );
     } finally {
       await IOUtils.remove(root.path, { recursive: true, ignoreAbsent: true });
     }

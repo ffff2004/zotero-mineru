@@ -22,9 +22,8 @@ describe("startup", function () {
       const deadline = Date.now() + 10000;
       while (Date.now() < deadline) {
         for (const candidate of Services.wm.getEnumerator(null)) {
-          const message = candidate.document?.getElementById(
-            "mineru-task-message",
-          );
+          const message =
+            candidate.document?.getElementById("mineru-plugin-log");
           if (message?.textContent?.includes("companion installer")) {
             dialog = candidate;
             break;

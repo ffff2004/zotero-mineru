@@ -28,6 +28,8 @@ export type ParseRequest = {
   options: ParseOptions;
   /** Shutdown signal; stopping the child prevents publication. */
   signal?: AbortSignal;
+  onPrepared?: () => void;
+  onParseStart?: () => void;
   onValidation?: () => void;
   onLogs?: (logs: { stdout: string; stderr: string }) => void;
 };
@@ -50,8 +52,11 @@ export class MineruTaskError extends Error {
       | "validation",
     message: string,
     public readonly logs?: { stdout: string; stderr: string },
+    cause?: unknown,
+    public readonly exitCode?: number,
+    public readonly cleanupErrors?: readonly unknown[],
   ) {
-    super(message);
+    super(message, { cause });
     this.name = "MineruTaskError";
   }
 }
@@ -100,8 +105,16 @@ function taskError(
   message: string,
   stdout: string,
   stderr: string,
+  cause?: unknown,
+  exitCode?: number,
 ): MineruTaskError {
-  return new MineruTaskError(category, message, { stdout, stderr });
+  return new MineruTaskError(
+    category,
+    message,
+    { stdout, stderr },
+    cause,
+    exitCode,
+  );
 }
 
 /** The caller owns publication and may retain the task directory for log actions. */
@@ -129,10 +142,10 @@ export async function runMineruParse(
   const packageDirectory = PathUtils.join(root, "package");
   const stdout = PathUtils.join(root, "stdout.log");
   const stderr = PathUtils.join(root, "stderr.log");
-  await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
-  await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
-  request.onLogs?.({ stdout, stderr });
   try {
+    await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
+    await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
+    request.onLogs?.({ stdout, stderr });
     const source = Zotero.File.pathToFile(request.pdfPath);
     if (!source.exists() || !source.isFile() || source.isSymlink()) {
       throw taskError("input", "Source PDF is unavailable", stdout, stderr);
@@ -161,11 +174,13 @@ export async function runMineruParse(
     if (request.signal?.aborted) {
       throw taskError("process", "MinerU task stopped", stdout, stderr);
     }
-    const { Subprocess } = ChromeUtils.importESModule(
-      "resource://gre/modules/Subprocess.sys.mjs",
-    ) as { Subprocess: SubprocessAPI };
+    request.onPrepared?.();
+    request.onParseStart?.();
     let child: Child;
     try {
+      const { Subprocess } = ChromeUtils.importESModule(
+        "resource://gre/modules/Subprocess.sys.mjs",
+      ) as { Subprocess: SubprocessAPI };
       child = await Subprocess.call({
         command: request.runtime.descriptor.mineru_kit,
         arguments: childArguments(pdf, zip, options),
@@ -175,20 +190,48 @@ export async function runMineruParse(
         environmentAppend: true,
         stderr: "pipe",
       });
-    } catch {
-      throw taskError("process", "Could not start MinerU", stdout, stderr);
+    } catch (error) {
+      throw taskError(
+        "process",
+        "Could not start MinerU; check the runtime executable",
+        stdout,
+        stderr,
+        error,
+      );
     }
     let stopped = false;
+    const cleanupErrors: unknown[] = [];
+    let termination: Promise<void> | undefined;
+    const killChild = () =>
+      (termination ??= child.kill().then(
+        () => undefined,
+        (error) => {
+          cleanupErrors.push(error);
+        },
+      ));
+    const processError = (
+      message: string,
+      cause?: unknown,
+      exitCode?: number,
+    ) =>
+      new MineruTaskError(
+        "process",
+        message,
+        { stdout, stderr },
+        cause,
+        exitCode,
+        cleanupErrors,
+      );
     const stop = () => {
       stopped = true;
-      void child.kill().catch(() => undefined);
+      void killChild();
     };
     request.signal?.addEventListener("abort", stop, { once: true });
     if (request.signal?.aborted) stop();
     try {
       const guardedDrain = (pipe: Pipe, path: string) =>
         drain(pipe, path).catch(async (error) => {
-          await child.kill().catch(() => undefined);
+          await killChild();
           throw error;
         });
       const [outcome, stdoutResult, stderrResult] = await Promise.allSettled([
@@ -196,16 +239,22 @@ export async function runMineruParse(
         guardedDrain(child.stdout, stdout),
         guardedDrain(child.stderr, stderr),
       ]);
+      if (termination) await termination;
       if (
         stdoutResult.status === "rejected" ||
         stderrResult.status === "rejected"
       ) {
-        await child.kill().catch(() => undefined);
-        throw taskError(
-          "process",
-          "Could not record MinerU output",
-          stdout,
-          stderr,
+        await killChild();
+        const errors = [stdoutResult, stderrResult].flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (outcome.status === "rejected") errors.push(outcome.reason);
+        throw processError(
+          "Could not record MinerU output; check disk access",
+          errors.length === 1
+            ? errors[0]
+            : new AggregateError(errors, "CLI stream recording failed"),
+          outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
         );
       }
       if (
@@ -213,29 +262,35 @@ export async function runMineruParse(
         stopped ||
         outcome.value.exitCode < 0
       ) {
-        throw taskError(
-          "process",
-          "MinerU process ended abnormally",
-          stdout,
-          stderr,
+        throw processError(
+          "MinerU process ended abnormally; inspect the CLI logs",
+          outcome.status === "rejected" ? outcome.reason : undefined,
+          outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
         );
       }
       if (outcome.value.exitCode !== 0) {
-        throw taskError("process", "MinerU 解析失败", stdout, stderr);
+        throw processError(
+          "MinerU 解析失败",
+          undefined,
+          outcome.value.exitCode,
+        );
       }
     } finally {
       request.signal?.removeEventListener("abort", stop);
     }
-    if (!(await IOUtils.exists(zip)) || !Zotero.File.pathToFile(zip).isFile()) {
-      throw taskError(
-        "validation",
-        "MinerU output ZIP is missing",
-        stdout,
-        stderr,
-      );
-    }
     request.onValidation?.();
     try {
+      if (
+        !(await IOUtils.exists(zip)) ||
+        !Zotero.File.pathToFile(zip).isFile()
+      ) {
+        throw taskError(
+          "validation",
+          "MinerU output ZIP is missing",
+          stdout,
+          stderr,
+        );
+      }
       await extractValidatedPackage(
         zip,
         packageDirectory,
@@ -244,18 +299,13 @@ export async function runMineruParse(
         options,
       );
     } catch (error) {
-      await IOUtils.write(
-        stderr,
-        new TextEncoder().encode(
-          `[plugin] Package validation: ${String(error)}\n`,
-        ),
-        { mode: "append" },
-      ).catch(() => undefined);
+      if (error instanceof MineruTaskError) throw error;
       throw taskError(
         "validation",
-        "MinerU result package is invalid",
+        "MinerU result package is invalid; inspect diagnostic details",
         stdout,
         stderr,
+        error,
       );
     }
     if (request.signal?.aborted) {
@@ -271,11 +321,12 @@ export async function runMineruParse(
     };
   } catch (error) {
     if (error instanceof MineruTaskError) throw error;
-    await IOUtils.write(
+    throw taskError(
+      "input",
+      "Could not prepare MinerU task; check file access and disk space",
+      stdout,
       stderr,
-      new TextEncoder().encode(`[plugin] Task preparation: ${String(error)}\n`),
-      { mode: "append" },
-    ).catch(() => undefined);
-    throw taskError("input", "Could not prepare MinerU task", stdout, stderr);
+      error,
+    );
   }
 }
