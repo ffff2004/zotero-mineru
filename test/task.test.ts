@@ -152,6 +152,12 @@ describe("MinerU selection and task interface", function () {
   });
 
   it("rejects multi-selection and unsupported items without starting a task", async function () {
+    const dir = directory();
+    const runtime = await runtimeFixture(
+      dir,
+      "selection",
+      "#!/bin/sh\nexit 99\n",
+    );
     const controller = new MineruTaskController();
     let failure = "";
     const views: string[] = [];
@@ -159,6 +165,7 @@ describe("MinerU selection and task interface", function () {
       [],
       async () => undefined,
       {
+        ...runtime,
         options: {
           tier: "standard",
           ocr_mode: "auto",
@@ -174,6 +181,7 @@ describe("MinerU selection and task interface", function () {
     assert.deepEqual(views, ["preparing", "failed"]);
     assert.match(failure, /exactly one/);
     assert.isFalse(controller.busy);
+    dir.remove(true);
   });
 
   it("holds the single-task lock during selection and suppresses callbacks after shutdown", async function () {
