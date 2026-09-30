@@ -1,131 +1,143 @@
-import { config } from "../../package.json";
+import { clearPref, getPref, setPref } from "../utils/prefs";
 import { getString } from "../utils/locale";
+import {
+  defaultRuntimeDescriptorPath,
+  readCompatibleRuntime,
+  resolveMineruConfigPath,
+} from "./mineru/runtime";
 
-export async function registerPrefsScripts(_window: Window) {
-  // This function is called when the prefs window is opened
-  // See addon/content/preferences.xhtml onpaneload
-  if (!addon.data.prefs) {
-    addon.data.prefs = {
-      window: _window,
-      columns: [
-        {
-          dataKey: "title",
-          label: getString("prefs-table-title"),
-          fixedWidth: true,
-          width: 100,
-        },
-        {
-          dataKey: "detail",
-          label: getString("prefs-table-detail"),
-        },
-      ],
-      rows: [
-        {
-          title: "Orange",
-          detail: "It's juicy",
-        },
-        {
-          title: "Banana",
-          detail: "It's sweet",
-        },
-        {
-          title: "Apple",
-          detail: "I mean the fruit APPLE",
-        },
-      ],
-    };
-  } else {
-    addon.data.prefs.window = _window;
+function effectiveConfigPath(customPath: string): string {
+  return resolveMineruConfigPath({
+    customPath,
+    inheritedConfig: Services.env.get("MINERU_CONFIG"),
+    mineruHome: Services.env.get("MINERU_HOME"),
+    home: Services.dirsvc.get("Home", Components.interfaces.nsIFile).path,
+    workingDirectory: Services.dirsvc.get(
+      "CurWorkD",
+      Components.interfaces.nsIFile,
+    ).path,
+  });
+}
+
+function openFile(win: Window, path: string): void {
+  let available = false;
+  try {
+    available = Zotero.File.pathToFile(path).isFile();
+  } catch {
+    // The configured path may no longer be valid.
   }
-  updatePrefsUI();
-  bindPrefEvents();
+  if (!available) {
+    win.alert(getString("config-unavailable"));
+    return;
+  }
+  Zotero.launchFile(path);
 }
 
-async function updatePrefsUI() {
-  // You can initialize some UI elements on prefs window
-  // with addon.data.prefs.window.document
-  // Or bind some events to the elements
-  const renderLock = ztoolkit.getGlobal("Zotero").Promise.defer();
-  if (addon.data.prefs?.window == undefined) return;
-  const tableHelper = new ztoolkit.VirtualizedTable(addon.data.prefs?.window)
-    .setContainerId(`${config.addonRef}-table-container`)
-    .setProp({
-      id: `${config.addonRef}-prefs-table`,
-      // Do not use setLocale, as it modifies the Zotero.Intl.strings
-      // Set locales directly to columns
-      columns: addon.data.prefs?.columns,
-      showHeader: true,
-      multiSelect: true,
-      staticColumns: true,
-      disableFontSizeScaling: true,
-    })
-    .setProp("getRowCount", () => addon.data.prefs?.rows.length || 0)
-    .setProp(
-      "getRowData",
-      (index) =>
-        addon.data.prefs?.rows[index] || {
-          title: "no data",
-          detail: "no data",
-        },
-    )
-    // Show a progress window when selection changes
-    .setProp("onSelectionChange", (selection) => {
-      new ztoolkit.ProgressWindow(config.addonName)
-        .createLine({
-          text: `Selected line: ${addon.data.prefs?.rows
-            .filter((v, i) => selection.isSelected(i))
-            .map((row) => row.title)
-            .join(",")}`,
-          progress: 100,
-        })
-        .show();
-    })
-    // When pressing delete, delete selected line and refresh table.
-    // Returning false to prevent default event.
-    .setProp("onKeyDown", (event: KeyboardEvent) => {
-      if (event.key == "Delete" || (Zotero.isMac && event.key == "Backspace")) {
-        addon.data.prefs!.rows =
-          addon.data.prefs?.rows.filter(
-            (v, i) => !tableHelper.treeInstance.selection.isSelected(i),
-          ) || [];
-        tableHelper.render();
-        return false;
+export async function registerPrefsScripts(win: Window): Promise<void> {
+  const doc = win.document;
+  const input = (id: string) =>
+    doc.getElementById(`mineru-${id}`) as HTMLInputElement;
+  const runtime = input("runtime");
+  const config = input("config");
+  const effective = doc.getElementById("mineru-config-effective")!;
+  const status = doc.getElementById("mineru-runtime-status")!;
+  runtime.value = String(getPref("runtimeDescriptor") || "");
+  config.value = String(getPref("configPath") || "");
+  input("tier").value = String(getPref("tier") || "standard");
+  input("ocr").value = String(getPref("ocrMode") || "auto");
+  input("images").checked = getPref("imageAnalysis") !== false;
+  input("pages").value = String(getPref("pageRange") || "all");
+  const configPath = () => effectiveConfigPath(config.value.trim());
+  const showEffective = () => {
+    effective.textContent = `${getString("effective-config")}: ${configPath()}`;
+  };
+  const checkRuntime = async () => {
+    const path = runtime.value.trim() || defaultRuntimeDescriptorPath();
+    try {
+      const descriptor = await readCompatibleRuntime(path);
+      status.textContent = `${getString("runtime-ready")}: ${descriptor.release_id} (${descriptor.profile})`;
+    } catch {
+      status.textContent = getString("runtime-unavailable");
+    }
+  };
+  runtime.addEventListener("change", () => {
+    setPref("runtimeDescriptor", runtime.value.trim());
+    void checkRuntime();
+  });
+  config.addEventListener("change", () => {
+    setPref("configPath", config.value.trim());
+    showEffective();
+  });
+  const button = (id: string, fn: () => void | Promise<void>) => {
+    doc.getElementById(`mineru-${id}`)?.addEventListener("command", () => {
+      void fn();
+    });
+  };
+  button("runtime-choose", async () => {
+    const path = await new ztoolkit.FilePicker(
+      getString("pref-runtime"),
+      "open",
+      [["JSON", "*.json"]],
+      undefined,
+      win,
+    ).open();
+    if (path) {
+      runtime.value = path;
+      setPref("runtimeDescriptor", path);
+      await checkRuntime();
+    }
+  });
+  button("runtime-check", checkRuntime);
+  button("config-choose", async () => {
+    const path = await new ztoolkit.FilePicker(
+      getString("pref-config"),
+      "open",
+      [["YAML", "*.yaml;*.yml"]],
+      undefined,
+      win,
+    ).open();
+    if (path) {
+      config.value = path;
+      setPref("configPath", path);
+      showEffective();
+    }
+  });
+  button("config-open", () => openFile(win, configPath()));
+  button("config-create", async () => {
+    const path = configPath();
+    try {
+      if (!(await IOUtils.exists(path))) {
+        await IOUtils.makeDirectory(PathUtils.parent(path) || "/", {
+          createAncestors: true,
+        });
+        await IOUtils.writeUTF8(path, "{}\n", { mode: "create" });
       }
-      return true;
-    })
-    // For find-as-you-type
-    .setProp(
-      "getRowString",
-      (index) => addon.data.prefs?.rows[index].title || "",
-    )
-    // Render the table.
-    .render(-1, () => {
-      renderLock.resolve();
-    });
-  await renderLock.promise;
-  ztoolkit.log("Preference table rendered!");
-}
-
-function bindPrefEvents() {
-  addon.data
-    .prefs!.window.document?.querySelector(
-      `#zotero-prefpane-${config.addonRef}-enable`,
-    )
-    ?.addEventListener("command", (e: Event) => {
-      ztoolkit.log(e);
-      addon.data.prefs!.window.alert(
-        `Successfully changed to ${(e.target as XUL.Checkbox).checked}!`,
-      );
-    });
-
-  addon.data
-    .prefs!.window.document?.querySelector(
-      `#zotero-prefpane-${config.addonRef}-input`,
-    )
-    ?.addEventListener("change", (e: Event) => {
-      ztoolkit.log(e);
-      addon.data.prefs!.window.alert(
-        `Successfully changed to ${(e.target as HTMLInputElement).value}!`,
-      );
-    });
+      openFile(win, path);
+    } catch {
+      win.alert(getString("config-create-failed"));
+    }
+  });
+  button("config-reset", () => {
+    clearPref("configPath");
+    config.value = "";
+    showEffective();
+  });
+  for (const [id, key] of [
+    ["tier", "tier"],
+    ["ocr", "ocrMode"],
+    ["pages", "pageRange"],
+  ] as const) {
+    input(id).addEventListener("change", () =>
+      setPref(
+        key,
+        input(id).value.trim() ||
+          (id === "pages" ? "all" : id === "ocr" ? "auto" : "standard"),
+      ),
+    );
+  }
+  input("images").addEventListener("change", () =>
+    setPref("imageAnalysis", input("images").checked),
+  );
+  showEffective();
+  await checkRuntime();
 }

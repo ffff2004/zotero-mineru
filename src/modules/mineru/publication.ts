@@ -31,6 +31,8 @@ export type PublicationRequest = {
   sourcePDF: Zotero.Item;
   /** Optional display title. The default is local creation time with UTC offset. */
   title?: string;
+  /** Prevent a new publication after plugin shutdown. */
+  signal?: AbortSignal;
 };
 
 export type RecoveryResult = { committed: number; rolledBack: number };
@@ -459,6 +461,7 @@ export async function publishValidatedPackage(
   active = true;
   let journal: Journal | undefined;
   try {
+    if (request.signal?.aborted) throw new Error("MinerU task stopped");
     const packageRecord = await describeTree(request.packageDirectory);
     await currentSource(request.sourcePDF);
     const token = crypto.randomUUID();
@@ -473,6 +476,7 @@ export async function publishValidatedPackage(
 
     let created: Zotero.Item | undefined;
     await Zotero.DB.executeTransaction(async () => {
+      if (request.signal?.aborted) throw new Error("MinerU task stopped");
       const source = await currentSource(request.sourcePDF);
       const item = new Zotero.Item("attachment");
       item.libraryID = source.item.libraryID;
@@ -512,6 +516,7 @@ export async function publishValidatedPackage(
           "New attachment metadata or upload state is incomplete",
         );
       }
+      if (request.signal?.aborted) throw new Error("MinerU task stopped");
       created = item;
     });
     if (!created || !(await verifyCommitted(journal, created, true))) {

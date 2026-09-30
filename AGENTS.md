@@ -9,8 +9,8 @@
 ## Project Structure
 
 Zotero MinerU is a TypeScript/ES module plugin based on Zotero Plugin Template.
-The current runtime contains template examples; MinerU integration is not yet
-implemented.
+The plugin integrates a locked companion MinerU runtime, validated ZIP export,
+and journaled multifile stored-attachment publication.
 
 ```text
 ./
@@ -18,12 +18,11 @@ implemented.
 |   |-- index.ts             # Plugin entrypoint
 |   |-- addon.ts             # Plugin state and API
 |   |-- hooks.ts             # Lifecycle and event handlers
-|   |-- modules/             # Feature modules and template examples
+|   |-- modules/             # Feature modules and MinerU orchestration
 |   |-- utils/               # Shared utilities
 |-- addon/                   # Bootstrap, manifest, UI, locales, and assets
 |-- typings/                 # Global TypeScript declarations
 |-- test/                    # Tests running inside Zotero
-|-- doc/                     # Translated template documentation
 |-- package.json             # Plugin identity, metadata, and scripts
 |-- pnpm-workspace.yaml      # Dependency compatibility and build permissions
 |-- zotero-plugin.config.ts  # Build, serve, and test configuration
@@ -56,7 +55,7 @@ also needs npm available.
 - Test each module through its public interface and assert observable behavior. Keep private helpers private; do not import, expose, or mock them for tests.
 - Use test doubles only at external boundaries. Exercise internal collaborating modules with their real implementations.
 
-- The current integration test checks that the plugin instance exists in Zotero.
+- Integration tests exercise the plugin instance and MinerU public module interfaces.
   Set `ZOTERO_PLUGIN_ZOTERO_BIN_PATH` using `.env.example`. Tests use a disposable
   profile and data directory under `.scaffold/test/`, cleared before each run.
 - For `pnpm start`, configure a separate development profile and data directory
@@ -64,8 +63,6 @@ also needs npm available.
 - On Linux, scaffold's serve/test cleanup defaults to `pkill -9 zotero`. Run these
   commands after closing existing Zotero sessions, or configure
   `ZOTERO_PLUGIN_KILL_COMMAND` to target only the development/test process.
-- Exercise the template examples against disposable items: example handlers can
-  change item titles.
 
 ## Issue tracker
 

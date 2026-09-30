@@ -28,6 +28,8 @@ export type ParseRequest = {
   options: ParseOptions;
   /** Shutdown signal; stopping the child prevents publication. */
   signal?: AbortSignal;
+  onValidation?: () => void;
+  onLogs?: (logs: { stdout: string; stderr: string }) => void;
 };
 
 export type ValidatedParse = {
@@ -129,6 +131,7 @@ export async function runMineruParse(
   const stderr = PathUtils.join(root, "stderr.log");
   await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
   await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
+  request.onLogs?.({ stdout, stderr });
   try {
     const source = Zotero.File.pathToFile(request.pdfPath);
     if (!source.exists() || !source.isFile() || source.isSymlink()) {
@@ -231,6 +234,7 @@ export async function runMineruParse(
         stderr,
       );
     }
+    request.onValidation?.();
     try {
       await extractValidatedPackage(
         zip,

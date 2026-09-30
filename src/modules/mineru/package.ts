@@ -23,7 +23,9 @@ const MAX_ZIP_BYTES = 1024 * 1024 * 1024;
 const MAX_ENTRY_BYTES = 256 * 1024 * 1024;
 const MAX_ENTRIES = 10000;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
-const validateSchema = new Ajv2020({ strict: false }).compile(middleSchema);
+const validateSchema = new Ajv2020({ strict: false, logger: false }).compile(
+  middleSchema,
+);
 
 type ArchiveEntry = { name: string; directory: boolean; size: number };
 

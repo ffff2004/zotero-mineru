@@ -3,7 +3,7 @@
   "release_id": "mineru-4.0.10-docvortex-0.5.7-py313-linux-x86_64-r1",
   "plugin": {
     "id": "zotero-mineru@ffff2004",
-    "version": "3.1.0"
+    "version": "0.1.0"
   },
   "platform": "linux-x86_64-glibc>=2.34",
   "python_version": "3.13.12",
