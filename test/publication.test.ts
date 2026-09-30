@@ -56,11 +56,20 @@ describe("MinerU stored attachment publication", function () {
         '{"package_format_version":1}\n',
       );
       await write(packageDir, "images/x.png", "image bytes");
+      const pane = Zotero.getMainWindow().ZoteroPane;
+      await pane.selectItem(source.id);
       result = await publishValidatedPackage({
         packageDirectory: packageDir.path,
         sourcePDF: source,
         title: "MinerU test result",
       });
+
+      await Zotero.Promise.delay(100);
+      assert.deepEqual(
+        pane.getSelectedItems().map((item) => item.id),
+        [source.id],
+        "publication preserves selection until Show result is clicked",
+      );
 
       assert.notEqual(result.id, source.id);
       assert.equal(result.attachmentContentType, "text/markdown");

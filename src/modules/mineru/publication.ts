@@ -504,7 +504,7 @@ export async function publishValidatedPackage(
       item.attachmentSyncState = "to_upload";
       item.setNote(SENTINEL);
       item.addRelation("dc:relation", source.sourceURI);
-      await item.save();
+      await item.save({ skipSelect: true });
       const dest = finalPath(item.key);
       if (await IOUtils.exists(dest))
         throw new Error("New attachment storage key already exists");
