@@ -15,8 +15,7 @@ uv run --no-project python scripts/install_runtime.py install --profile cpu
 The NVIDIA profile adds MinerU's published `torch` extra, currently locking
 PyTorch 2.14.0 and its CUDA 13 dependencies. It requires a compatible NVIDIA
 driver and has a substantially larger download. Device and model choices remain
-in the MinerU config. The published dependency metadata supports this install
-profile; hardware execution still needs acceptance testing on the target GPU.
+in the MinerU config.
 
 ```sh
 uv run --no-project python scripts/install_runtime.py install --profile nvidia
@@ -35,7 +34,9 @@ virtual environments. Parsed attachments and MinerU config are untouched.
 The installer checks actual installed distribution metadata for both packages,
 `mineru-kit version --json` for MinerU, and published parse options. The CLI
 JSON version output does not contain the DocVortex version. The Zotero plugin
-reads installed `METADATA` directly on first use and after runtime changes.
+reads the descriptor and installed `METADATA` when Preferences checks status or
+a task starts. It also checks the expected interpreter and CLI paths for
+executable files. Only the installer invokes `version --json`.
 The descriptor does not carry a config path.
 
 Config path selection is: saved Preferences value, inherited nonempty
@@ -47,6 +48,6 @@ access. No Python package install occurs during a parse. To inspect a failure,
 read the separate task stdout and stderr logs, check the selected config file,
 and rerun the installer for a missing or mismatched runtime.
 
-The installer verifies package and CLI surface compatibility. A real PDF ZIP
-export, MiddleJson schema, independent assets, and Zotero sync require release
-acceptance testing; this metadata check does not establish those outcomes.
+The installer checks package versions and CLI argument support before activating
+the descriptor. Each result package is checked for ZIP layout, MiddleJson schema,
+and asset references before it is saved.

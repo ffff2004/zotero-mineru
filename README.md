@@ -2,7 +2,7 @@
 
 Zotero MinerU turns a selected PDF into a new stored Markdown attachment. The result keeps `markdown.md`, `middle_json.json`, exported images and auxiliary JSON, and a small `provenance.json` together in one Zotero storage directory. The source PDF is never changed. Repeating a run creates another attachment.
 
-The current companion release targets Linux x86_64, Zotero 10, Python 3.13.12, MinerU 4.0.10 and DocVortex 0.5.7. The installer provides CPU and NVIDIA dependency profiles; NVIDIA use also needs a compatible driver. A local CPU parse and Zotero publication passed with a real PDF. NVIDIA hardware execution and remote sync acceptance remain unverified. Intel iGPU acceleration is not claimed.
+The companion release targets Linux x86_64, Zotero 10, Python 3.13.12, MinerU 4.0.10 and DocVortex 0.5.7. The installer provides CPU and NVIDIA dependency profiles; NVIDIA use also needs a compatible driver. Intel iGPU acceleration is not supported by this release.
 
 ## Install
 
@@ -14,7 +14,7 @@ The current companion release targets Linux x86_64, Zotero 10, Python 3.13.12, M
 
 Open Zotero Preferences → Zotero MinerU. The runtime status checks the descriptor and actual installed package metadata. Choose a different `runtime.json` if needed.
 
-The MinerU configuration path follows this order: the saved custom path, a nonempty `MINERU_CONFIG` inherited by the Zotero process, then `MINERU_HOME/config.yaml` or `~/.mineru/config.yaml`. The controls show the effective path, let you choose or open a file, create a minimal `{}` YAML file if absent, and reset the custom path. The file may hold plain-text credentials; it is never copied into the result. The path and task options are frozen when a task starts, so edits affect the next run. A terminal's environment is not necessarily inherited by the Zotero desktop process.
+The MinerU configuration path follows this order: the saved custom path, a nonempty `MINERU_CONFIG` inherited by the Zotero process, then `MINERU_HOME/config.yaml` or `~/.mineru/config.yaml`. The controls show the effective path, let you choose or open a file, create a minimal `{}` YAML file if absent, and reset the custom path. The file may hold plain-text credentials; it is never copied into the result. The runtime selection, executable path, config path and task options are frozen when a task starts, so edits affect the next run. A terminal's environment is not necessarily inherited by the Zotero desktop process.
 
 Task defaults are `tier=standard`, `ocr_mode=auto`, image analysis enabled, and pages `all`. Page range uses MinerU CLI syntax such as `1-5` or `r1`. Model, device, and service configuration belong in MinerU's YAML file. The plugin does not provide arbitrary CLI arguments or an environment editor.
 
@@ -28,6 +28,6 @@ Only one task runs per plugin instance. Closing or disabling the plugin stops an
 
 ## Current limits
 
-The CLI's stdout and stderr are diagnostics only. A nonzero exit reports “MinerU 解析失败”; inspect the separate logs and configuration file for details. The plugin cannot expose reliable internal parse percentages or infer the exact MinerU internal error from log text. Its Markdown follows the companion CLI's normal export and does not add page markers or blank-page placeholders. The XPI excludes Python, drivers, and models. Remote Zotero Storage and WebDAV round trips require validation with credentials.
+The CLI's stdout and stderr are diagnostics only. A nonzero exit reports “MinerU 解析失败”; inspect the separate logs and configuration file for details. The plugin cannot expose reliable internal parse percentages or infer the exact MinerU internal error from log text. Its Markdown follows the companion CLI's normal export and does not add page markers or blank-page placeholders. The XPI excludes Python, drivers, and models.
 
 The source PDF is related to the result by Zotero's native `dc:relation`; the result note contains `zotero-mineru-generation:v1`. The standalone package only records the input snapshot SHA-256, not Zotero item identity. The new attachment is journaled during publication so startup can recover an incomplete write.

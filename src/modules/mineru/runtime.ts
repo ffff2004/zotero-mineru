@@ -111,6 +111,15 @@ function isFile(path: string): boolean {
   }
 }
 
+function isExecutableFile(path: string): boolean {
+  try {
+    const file = Zotero.File.pathToFile(path);
+    return file.isFile() && file.isExecutable();
+  } catch {
+    return false;
+  }
+}
+
 function metadataVersion(text: string, name: string): string {
   const headers = text.split(/\r?\n\r?\n/, 1)[0];
   const actualName = /^Name:\s*(.+)$/im.exec(headers)?.[1]?.trim();
@@ -165,10 +174,12 @@ export async function readCompatibleRuntime(
     !absolute(runtime.mineru_kit) ||
     normalize(runtime.python) !== PathUtils.join(bin, "python") ||
     normalize(runtime.mineru_kit) !== PathUtils.join(bin, "mineru-kit") ||
-    !isFile(runtime.python) ||
-    !isFile(runtime.mineru_kit)
+    !isExecutableFile(runtime.python) ||
+    !isExecutableFile(runtime.mineru_kit)
   ) {
-    throw new Error("MinerU runtime executables are missing or inconsistent");
+    throw new Error(
+      "MinerU runtime executables are missing, not executable, or inconsistent",
+    );
   }
   for (const name of ["mineru", "docvortex"] as const) {
     const record = runtime.packages[name];

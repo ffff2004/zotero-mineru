@@ -75,6 +75,8 @@ describe("MinerU companion runtime", function () {
       const cli = PathUtils.join(bin, "mineru-kit");
       await IOUtils.writeUTF8(python, "python fixture");
       await IOUtils.writeUTF8(cli, "cli fixture");
+      Zotero.File.pathToFile(python).permissions = 0o755;
+      Zotero.File.pathToFile(cli).permissions = 0o755;
       const packages: Record<
         string,
         { version: string; metadata_path: string }
@@ -113,6 +115,37 @@ describe("MinerU companion runtime", function () {
       });
       assert.equal(next.configPath, "/env/second.yaml");
       assert.match(initial.configPath, /\/first\.yaml$/);
+
+      for (const executable of [python, cli]) {
+        Zotero.File.pathToFile(executable).permissions = 0o644;
+        let rejected = false;
+        try {
+          await readCompatibleRuntime(path);
+        } catch (error) {
+          rejected = true;
+          assert.match(String(error), /not executable/);
+        }
+        assert.isTrue(rejected);
+        Zotero.File.pathToFile(executable).permissions = 0o755;
+        assert.equal((await readCompatibleRuntime(path)).mineru_kit, cli);
+      }
+
+      await IOUtils.writeUTF8(
+        packages.mineru.metadata_path,
+        "Name: mineru\nVersion: 0.0.0\n\n",
+      );
+      let mineruRejected = false;
+      try {
+        await readCompatibleRuntime(path);
+      } catch (error) {
+        mineruRejected = true;
+        assert.match(String(error), /mineru version is incompatible/);
+      }
+      assert.isTrue(mineruRejected);
+      await IOUtils.writeUTF8(
+        packages.mineru.metadata_path,
+        `Name: mineru\nVersion: ${manifest.packages.mineru.version}\n\n`,
+      );
 
       await IOUtils.writeUTF8(
         packages.docvortex.metadata_path,

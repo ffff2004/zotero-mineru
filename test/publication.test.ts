@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import {
+  PublicationRecoveryError,
   publishValidatedPackage,
   recoverIncompletePublications,
 } from "../src/modules/mineru/publication";
@@ -246,7 +247,7 @@ describe("MinerU stored attachment publication", function () {
         }
         return originalWrite(path, content, options);
       };
-      let failure = "";
+      let failure: unknown;
       try {
         await publishValidatedPackage({
           packageDirectory: packageDir.path,
@@ -254,9 +255,14 @@ describe("MinerU stored attachment publication", function () {
           title: "recover committed result",
         });
       } catch (error) {
-        failure = String(error);
+        failure = error;
       }
-      assert.match(failure, /injected journal write failure/);
+      assert.instanceOf(failure, PublicationRecoveryError);
+      assert.equal((failure as PublicationRecoveryError).kind, "finalization");
+      assert.match(
+        String((failure as PublicationRecoveryError).errors[0]),
+        /injected journal write failure/,
+      );
       result = (await Zotero.Items.getAll(source.libraryID)).find(
         (item) => item.getField("title") === "recover committed result",
       );

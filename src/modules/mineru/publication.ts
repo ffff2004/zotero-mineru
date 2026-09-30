@@ -37,6 +37,20 @@ export type PublicationRequest = {
 
 export type RecoveryResult = { committed: number; rolledBack: number };
 
+/** Cleanup could not finish; the journal must be retried at startup. */
+export class PublicationRecoveryError extends AggregateError {
+  constructor(
+    publicationError: unknown,
+    cleanupError: unknown,
+    public readonly kind: "rollback" | "finalization" = "rollback",
+  ) {
+    super(
+      [publicationError, cleanupError],
+      "Publication failed; recovery journal retained",
+    );
+  }
+}
+
 let active = false;
 
 function pathFor(...parts: string[]): string {
@@ -527,14 +541,19 @@ export async function publishValidatedPackage(
     await removeJournal(journal);
     return created;
   } catch (error) {
-    if (journal?.phase !== "committed") {
+    if (journal?.phase === "committed") {
+      if (await IOUtils.exists(journalPath(journal.token)).catch(() => true)) {
+        throw new PublicationRecoveryError(
+          error,
+          new Error("Committed attachment journal finalization incomplete"),
+          "finalization",
+        );
+      }
+    } else {
       try {
         if (journal) await recoverOne(journal);
       } catch (cleanupError) {
-        throw new AggregateError(
-          [error, cleanupError],
-          "Publication failed; recovery journal retained",
-        );
+        throw new PublicationRecoveryError(error, cleanupError);
       }
     }
     throw error;

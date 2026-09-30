@@ -1,6 +1,9 @@
 import { freezeRuntime } from "./runtime";
 import { runMineruParse, MineruTaskError } from "./parse";
-import { publishValidatedPackage } from "./publication";
+import {
+  PublicationRecoveryError,
+  publishValidatedPackage,
+} from "./publication";
 import type { ParseOptions } from "./package";
 
 export type TaskPhase =
@@ -13,6 +16,7 @@ export type TaskPhase =
 export type TaskView = {
   phase: TaskPhase;
   message?: string;
+  failureCategory?: MineruTaskError["category"] | "persistence" | "recovery";
   logs?: { stdout: string; stderr: string };
   result?: Zotero.Item;
   configPath?: string;
@@ -25,6 +29,16 @@ export type TaskSettings = {
 export type ChoosePDF = (
   pdfs: Zotero.Item[],
 ) => Promise<Zotero.Item | undefined>;
+
+class PublicationTaskError extends Error {
+  constructor(
+    readonly category: "persistence" | "recovery",
+    message: string,
+    readonly logs?: TaskView["logs"],
+  ) {
+    super(message);
+  }
+}
 
 /** Resolve one menu selection. The returned attachment is always the exact source PDF. */
 export async function resolveSelectedPDF(
@@ -109,7 +123,26 @@ export class MineruTaskController {
     let logs: TaskView["logs"];
     let configPath: string | undefined;
     try {
+      const frozenSettings = {
+        descriptorPath: settings.descriptorPath,
+        customConfigPath: settings.customConfigPath,
+        options: { ...settings.options },
+      };
       emit({ phase: "preparing" });
+      let runtime;
+      try {
+        runtime = await freezeRuntime({
+          descriptorPath: frozenSettings.descriptorPath || undefined,
+          customConfigPath: frozenSettings.customConfigPath,
+        });
+      } catch {
+        throw new MineruTaskError(
+          "environment",
+          "MinerU runtime is missing or incompatible; run the companion installer",
+        );
+      }
+      configPath = runtime.configPath;
+      if (abort.signal.aborted) return;
       const source = await resolveSelectedPDF(items, choose);
       let path = await source.getFilePathAsync();
       if (!path && source.isStoredFileAttachment()) {
@@ -129,25 +162,11 @@ export class MineruTaskController {
         );
       }
       if (abort.signal.aborted) return;
-      let runtime;
-      try {
-        runtime = await freezeRuntime({
-          descriptorPath: settings.descriptorPath || undefined,
-          customConfigPath: settings.customConfigPath,
-        });
-      } catch {
-        throw new MineruTaskError(
-          "environment",
-          "MinerU runtime is missing or incompatible; run the companion installer",
-        );
-      }
-      configPath = runtime.configPath;
-      if (abort.signal.aborted) return;
       emit({ phase: "parsing", configPath });
       const parsed = await runMineruParse({
         pdfPath: path,
         runtime,
-        options: { ...settings.options },
+        options: frozenSettings.options,
         signal: abort.signal,
         onValidation: () => emit({ phase: "validation", configPath }),
         onLogs: (files) => {
@@ -170,14 +189,20 @@ export class MineruTaskController {
           await IOUtils.write(
             logs.stderr,
             new TextEncoder().encode(
-              `[plugin] Publication: ${String(error)}\n`,
+              `[plugin] Publication: ${String(error)}${error instanceof AggregateError ? `; causes: ${error.errors.map(String).join("; ")}` : ""}\n`,
             ),
             { mode: "append" },
           ).catch(() => undefined);
         }
-        throw new MineruTaskError(
-          "input",
-          "Could not save result; check source and library permissions or recovery log",
+        throw new PublicationTaskError(
+          error instanceof PublicationRecoveryError
+            ? "recovery"
+            : "persistence",
+          error instanceof PublicationRecoveryError
+            ? error.kind === "finalization"
+              ? "Result completion could not be confirmed; a recovery journal was retained. Restart Zotero to retry recovery; see stderr for details"
+              : "Could not save result; rollback or cleanup failed and a recovery journal was retained. Restart Zotero to retry recovery; see stderr for details"
+            : "Could not save result; check source and library permissions and stderr log",
           logs,
         );
       }
@@ -185,13 +210,29 @@ export class MineruTaskController {
       emit({ phase: "done", logs, result, configPath });
       return result;
     } catch (error) {
-      if (error instanceof MineruTaskError && error.logs) logs = error.logs;
+      if (
+        (error instanceof MineruTaskError ||
+          error instanceof PublicationTaskError) &&
+        error.logs
+      )
+        logs = error.logs;
       if (!abort.signal.aborted) {
         const message =
-          error instanceof MineruTaskError
+          error instanceof MineruTaskError ||
+          error instanceof PublicationTaskError
             ? error.message
             : "MinerU task failed; see stderr for details";
-        emit({ phase: "failed", message, logs, configPath });
+        emit({
+          phase: "failed",
+          message,
+          failureCategory:
+            error instanceof MineruTaskError ||
+            error instanceof PublicationTaskError
+              ? error.category
+              : undefined,
+          logs,
+          configPath,
+        });
       }
       return undefined;
     } finally {

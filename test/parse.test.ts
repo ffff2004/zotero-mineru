@@ -20,6 +20,7 @@ async function runtime(root: nsIFile, script: string) {
   const cli = PathUtils.join(bin, "mineru-kit");
   await IOUtils.writeUTF8(python, "fixture");
   await IOUtils.writeUTF8(cli, script);
+  Zotero.File.pathToFile(python).permissions = 0o755;
   Zotero.File.pathToFile(cli).permissions = 0o755;
   const packages: Record<string, { version: string; metadata_path: string }> =
     {};
