@@ -2,9 +2,23 @@
 
 This release combination pins official PyPI `mineru` 4.0.10 and `docvortex`
 0.5.7 with CPython 3.13.12. The hash-locked dependency sets target glibc 2.34
-or newer. The source and wheel hashes are in `release.json`; `SHA256SUMS` covers
-the distributable files and built XPI. Rebuild that file after the final XPI
-build with `uv run --no-project python scripts/write_release_checksums.py`.
+or newer. The source and wheel hashes are in `release.json`.
+
+After the final production build, generate and verify both checksum files from
+the repository root:
+
+```sh
+pnpm build
+uv run --no-project python scripts/write_release_checksums.py
+sha256sum -c runtime/SHA256SUMS
+(cd .scaffold/build && sha256sum -c XPI-SHA256SUMS)
+```
+
+Commit `runtime/SHA256SUMS` with the stable companion distribution files. Ship
+`.scaffold/build/XPI-SHA256SUMS` beside `zotero-miner-u.xpi` as a release
+artifact. The XPI checksum is generated at release time because the build embeds
+a changing build timestamp; rebuild the XPI only before regenerating its
+checksum.
 
 Install the CPU profile with:
 
