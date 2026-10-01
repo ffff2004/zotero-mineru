@@ -680,6 +680,136 @@ describe("MinerU selection and task interface", function () {
     }
   });
 
+  for (const scenario of [
+    "malformed runtime",
+    "prefixed exception",
+    "sensitive payloads",
+  ] as const) {
+    const title = `renders and copies safe original diagnostics for ${scenario}`;
+
+    it(title, async function () {
+      const dir = directory();
+      const source = await pdf(dir, "source.pdf");
+      const runtime = await runtimeFixture(
+        dir,
+        "runtime",
+        "#!/bin/sh\nexit 99\n",
+      );
+      const originalPath = source.getFilePathAsync;
+      const originalCopy = Zotero.Utilities.Internal.copyTextToClipboard;
+      const before = new Set(Array.from(Services.wm.getEnumerator(null)));
+      const report = createTaskWindow();
+      let win: Window | undefined;
+      let copied = "";
+      let expected = "Error: source disk access refused at line 12";
+      try {
+        if (scenario === "malformed runtime") {
+          const malformed = '{"schema_version":';
+          await IOUtils.writeUTF8(runtime.descriptorPath, malformed);
+          try {
+            JSON.parse(malformed);
+          } catch (error) {
+            expected = (error as Error).message;
+          }
+          assert.include(expected, "JSON.parse:");
+        } else {
+          source.getFilePathAsync = async () => {
+            if (scenario === "prefixed exception") {
+              throw new Error(expected, {
+                cause: new SyntaxError(
+                  "JSON.parse: unexpected end of data at line 3 column 7 of the JSON data",
+                ),
+              });
+            }
+            throw new AggregateError(
+              [
+                new Error("llm: config-content-value"),
+                new Error("Error: llm: prefixed-config-value"),
+                new Error('Error: {"model": "inline-config-value"}'),
+                new Error("MODEL_ROOT=environment-content-value"),
+                new Error("configuration payload: model-content-value"),
+                new Error("environment: ENV_CONTENT=environment-dump-value"),
+              ],
+              "Error: source disk access refused; api_key=inline-key-value https://user:pass@example.org/check?key=url-key-value",
+              {
+                cause: new Error(
+                  "JSON.parse: unexpected end of data at line 3 column 7; Authorization: Bearer bearer-value",
+                ),
+              },
+            );
+          };
+        }
+        await new MineruTaskController().run(
+          [source],
+          async () => source,
+          {
+            descriptorPath: runtime.descriptorPath,
+            customConfigPath: runtime.configPath,
+            options: defaults(),
+          },
+          report,
+        );
+        const deadline = Date.now() + 10000;
+        while (!win && Date.now() < deadline) {
+          win = Array.from(Services.wm.getEnumerator(null)).find(
+            (candidate) =>
+              !before.has(candidate) &&
+              candidate.document
+                .getElementById("mineru-plugin-log")
+                ?.querySelector("details"),
+          );
+          if (!win) await Zotero.Promise.delay(30);
+        }
+        assert.isDefined(win);
+        const details = win!.document.querySelector(
+          "#mineru-plugin-log details",
+        ) as HTMLDetailsElement;
+        details.open = true;
+        const displayed = details.querySelector("pre")!.textContent!;
+        if (scenario === "sensitive payloads") {
+          assert.include(displayed, "Error: source disk access refused");
+          assert.include(
+            displayed,
+            "JSON.parse: unexpected end of data at line 3 column 7",
+          );
+          for (const value of [
+            "config-content-value",
+            "prefixed-config-value",
+            "inline-config-value",
+            "environment-content-value",
+            "model-content-value",
+            "environment-dump-value",
+            "inline-key-value",
+            "url-key-value",
+            "user:pass",
+            "bearer-value",
+          ])
+            assert.notInclude(displayed, value);
+          assert.include(displayed, "[sensitive payload omitted]");
+          assert.include(displayed, "[redacted]");
+        } else {
+          assert.include(displayed, expected);
+          if (scenario === "prefixed exception")
+            assert.include(
+              displayed,
+              "JSON.parse: unexpected end of data at line 3 column 7 of the JSON data",
+            );
+        }
+        Zotero.Utilities.Internal.copyTextToClipboard = (text: string) => {
+          copied = text;
+        };
+        (win!.document.getElementById("copy") as HTMLButtonElement).click();
+        assert.include(copied, displayed);
+      } finally {
+        source.getFilePathAsync = originalPath;
+        Zotero.Utilities.Internal.copyTextToClipboard = originalCopy;
+        win?.close();
+        await source.eraseTx();
+        dir.remove(true);
+      }
+    });
+  }
+
   it("stops the actual child and sends no late updates or publication after task shutdown", async function () {
     const dir = directory();
     const source = await pdf(dir, "source.pdf");

@@ -30,10 +30,17 @@ function safeText(text: string): string {
         );
       // Error messages sometimes embed YAML, JSON, environment or credentials.
       // Suppress payload lines; only diagnostic text and stack frames belong here.
+      // Check the contents after diagnostic prefixes too: "Error: llm: ..."
+      // still embeds YAML, while "JSON.parse: unexpected ..." is a reason.
+      const contents = line.replace(
+        /^\s*(?:(?:[\w.$]*Error|[\w.$]*Exception|JSON\.parse)\s*:\s*)+/,
+        "",
+      );
       if (
-        /^\s*[{[](?!redacted\])|^\s*[A-Z_][A-Z_0-9]*=|^\s*[a-z_][\w.-]*\s*[:=]|config(?:uration)?\s*(?:contents?|payload)|environment\s*[:={]|\b(?:secret|credential|password|token)\b(?!\s*[:=])/i.test(
+        /(?:^\s*|[:=]\s*)[{[](?!redacted\])|^\s*[A-Z_][A-Z_0-9]*=|config(?:uration)?\s*(?:contents?|payload)|environment\s*[:={]|\b(?:secret|credential|password|token)\b(?!\s*[:=])/i.test(
           line,
-        )
+        ) ||
+        /^\s*[a-z_][\w.-]*\s*[:=]/i.test(contents)
       )
         return "[sensitive payload omitted]";
       return line
