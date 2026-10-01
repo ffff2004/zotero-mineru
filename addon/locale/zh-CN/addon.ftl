@@ -1,6 +1,6 @@
-prefs-title = Zotero MinerU
+prefs-title = __addonName__
 run-mineru = 运行 MinerU
-task-title = Zotero MinerU
+task-title = __addonName__
 choose-pdf = 选择要解析的 PDF
 already-running = MinerU 任务正在运行。
 recovery-failed = MinerU 未能恢复未完成的发布。请查看 Zotero 错误日志。

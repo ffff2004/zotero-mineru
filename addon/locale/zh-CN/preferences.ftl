@@ -1,4 +1,4 @@
-pref-title = Zotero MinerU
+pref-title = __addonName__
 pref-runtime-help = 解析前请安装配套运行环境。也可以选择其他运行时描述文件。
 pref-runtime = 运行时描述文件
 pref-choose = 选择…

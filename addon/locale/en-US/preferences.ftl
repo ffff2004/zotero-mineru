@@ -1,4 +1,4 @@
-pref-title = Zotero MinerU
+pref-title = __addonName__
 pref-runtime-help = Install the companion runtime before parsing. You can select another runtime descriptor.
 pref-runtime = Runtime descriptor
 pref-choose = Choose…
