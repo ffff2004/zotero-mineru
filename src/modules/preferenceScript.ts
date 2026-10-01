@@ -4,7 +4,10 @@ import {
   defaultRuntimeDescriptorPath,
   readCompatibleRuntime,
   resolveCurrentMineruConfigPath,
+  companionRepairCommand,
+  companionReleaseID,
 } from "./mineru/runtime";
+import { safeDiagnostic } from "./mineru/pluginLog";
 
 function openFile(win: Window, path: string): void {
   let available = false;
@@ -47,8 +50,25 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
     try {
       const descriptor = await readCompatibleRuntime(path);
       status.textContent = `${getString("runtime-ready")}: ${descriptor.release_id} (${descriptor.profile})`;
-    } catch {
-      status.textContent = getString("runtime-unavailable");
+    } catch (error) {
+      status.textContent = [
+        getString("runtime-unavailable"),
+        safeDiagnostic(error)?.split("\n")[0],
+        getString("runtime-repair", {
+          args: {
+            release: companionReleaseID,
+            command: companionRepairCommand(path, error),
+            descriptor: PathUtils.join(
+              PathUtils.parent(
+                path.startsWith("/") ? path : defaultRuntimeDescriptorPath(),
+              )!,
+              "runtime.json",
+            ),
+          },
+        }),
+      ]
+        .filter(Boolean)
+        .join("\n");
     }
   };
   runtime.addEventListener("change", () => {

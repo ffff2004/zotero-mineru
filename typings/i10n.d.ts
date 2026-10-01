@@ -47,6 +47,7 @@ export type FluentMessageId =
   | 'recovery-failed'
   | 'run-mineru'
   | 'runtime-ready'
+  | 'runtime-repair'
   | 'runtime-unavailable'
   | 'show-result'
   | 'task-title';

@@ -193,6 +193,71 @@ describe("MinerU Preferences", function () {
     }
   });
 
+  it("distinguishes missing executables from installed-version mismatch and provides the release repair command", async function () {
+    const original = await IOUtils.readUTF8(descriptorPath);
+    const runtime = JSON.parse(original);
+    runtime.profile = "nvidia";
+    const metadata = runtime.packages.mineru.metadata_path;
+    const originalMetadata = await IOUtils.readUTF8(metadata);
+    try {
+      await IOUtils.writeUTF8(descriptorPath, JSON.stringify(runtime));
+      await IOUtils.remove(runtime.mineru_kit);
+      await registerPrefsScripts(win);
+      const status = win.document.getElementById("mineru-runtime-status")!;
+      assert.include(status.textContent!, "executables are missing");
+      assert.notInclude(status.textContent!, "version is incompatible");
+      assert.include(status.textContent!, manifest.release_id);
+      assert.include(
+        status.textContent!,
+        `uv run --no-project python scripts/install_runtime.py install --profile nvidia --data-home '${root}'`,
+      );
+      assert.include(status.textContent!, descriptorPath);
+      await IOUtils.writeUTF8(runtime.mineru_kit, "fixture");
+      Zotero.File.pathToFile(runtime.mineru_kit).permissions = 0o755;
+      await IOUtils.writeUTF8(metadata, "Name: mineru\nVersion: 0.0.0\n\n");
+      win.document
+        .getElementById("mineru-runtime-check")!
+        .dispatchEvent(new win.Event("command"));
+      await waitFor(
+        () =>
+          !!status.textContent?.includes(
+            "Installed mineru version is incompatible",
+          ),
+      );
+      assert.notInclude(status.textContent!, "executables are missing");
+      assert.include(status.textContent!, "--profile nvidia");
+    } finally {
+      await IOUtils.writeUTF8(descriptorPath, original);
+      await IOUtils.writeUTF8(metadata, originalMetadata);
+      await IOUtils.writeUTF8(runtime.mineru_kit, "fixture");
+      Zotero.File.pathToFile(runtime.mineru_kit).permissions = 0o755;
+    }
+  });
+
+  it("shows a safe JSON parser cause and an explicit CPU repair when no profile is known", async function () {
+    const original = await IOUtils.readUTF8(descriptorPath);
+    const malformed = '{"private": "descriptor-content-value",';
+    let expected = "";
+    try {
+      JSON.parse(malformed);
+    } catch (error) {
+      expected = (error as Error).message;
+    }
+    try {
+      await IOUtils.writeUTF8(descriptorPath, malformed);
+      await registerPrefsScripts(win);
+      const status = win.document.getElementById(
+        "mineru-runtime-status",
+      )!.textContent!;
+      assert.include(status, expected);
+      assert.notInclude(status, "descriptor-content-value");
+      assert.include(status, "--profile cpu");
+      assert.include(status, manifest.release_id);
+    } finally {
+      await IOUtils.writeUTF8(descriptorPath, original);
+    }
+  });
+
   it("creates and opens the displayed named-user path without overwriting it, and resets precedence", async function () {
     const toRoot = "../".repeat(namedHome.split("/").filter(Boolean).length);
     const custom = `~${namedUser}/${toRoot}${root.slice(1)}/named-config.yaml`;

@@ -21,6 +21,38 @@ export type RuntimeSnapshot = {
   childEnvironment: { MINERU_CONFIG: string };
 };
 
+/** Carries only the supported installation profile, never descriptor payloads. */
+export class RuntimeCompatibilityError extends Error {
+  constructor(
+    cause: unknown,
+    public readonly profile: RuntimeDescriptor["profile"],
+  ) {
+    super(
+      cause instanceof Error ? cause.message : "MinerU runtime check failed",
+      {
+        cause,
+      },
+    );
+    this.name = "RuntimeCompatibilityError";
+  }
+}
+
+/** Run from the companion checkout for this manifest's release. */
+export function companionRepairCommand(
+  descriptorPath: string,
+  error: unknown,
+): string {
+  const profile =
+    error instanceof RuntimeCompatibilityError ? error.profile : "cpu";
+  const dataHome = parent(
+    absolute(descriptorPath) ? descriptorPath : defaultRuntimeDescriptorPath(),
+  );
+  const quotedHome = `'${dataHome.replace(/'/g, "'\\''")}'`;
+  return `uv run --no-project python scripts/install_runtime.py install --profile ${profile} --data-home ${quotedHome}`;
+}
+
+export const companionReleaseID = manifest.release_id;
+
 export type ConfigPathInputs = {
   customPath?: string | null;
   inheritedConfig?: string | null;
@@ -179,6 +211,17 @@ export async function readCompatibleRuntime(
     throw new Error("MinerU runtime descriptor is invalid");
   }
   const runtime = value as RuntimeDescriptor;
+  const profile = runtime.profile === "nvidia" ? "nvidia" : "cpu";
+  try {
+    return await checkInstalledRuntime(runtime);
+  } catch (error) {
+    throw new RuntimeCompatibilityError(error, profile);
+  }
+}
+
+async function checkInstalledRuntime(
+  runtime: RuntimeDescriptor,
+): Promise<RuntimeDescriptor> {
   if (
     runtime.schema_version !== 1 ||
     runtime.release_id !== manifest.release_id ||

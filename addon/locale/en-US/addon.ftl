@@ -19,7 +19,10 @@ config-unavailable = The configuration file is not available. Create it in Prefe
 config-create-failed = Could not create the configuration file. Check the directory permissions.
 effective-config = Effective configuration path
 runtime-ready = Compatible runtime
-runtime-unavailable = Runtime missing or incompatible. Run the companion installer.
+runtime-unavailable = Runtime missing or incompatible.
+runtime-repair = From the companion checkout for release { $release }, run:
+    { $command }
+    Then select the installed descriptor: { $descriptor }
 plugin-log = Plugin log
 copy-plugin-log = Copy plugin log
 log-details = Diagnostic details
