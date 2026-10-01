@@ -3,21 +3,8 @@ import { getString } from "../utils/locale";
 import {
   defaultRuntimeDescriptorPath,
   readCompatibleRuntime,
-  resolveMineruConfigPath,
+  resolveCurrentMineruConfigPath,
 } from "./mineru/runtime";
-
-function effectiveConfigPath(customPath: string): string {
-  return resolveMineruConfigPath({
-    customPath,
-    inheritedConfig: Services.env.get("MINERU_CONFIG"),
-    mineruHome: Services.env.get("MINERU_HOME"),
-    home: Services.dirsvc.get("Home", Components.interfaces.nsIFile).path,
-    workingDirectory: Services.dirsvc.get(
-      "CurWorkD",
-      Components.interfaces.nsIFile,
-    ).path,
-  });
-}
 
 function openFile(win: Window, path: string): void {
   let available = false;
@@ -47,9 +34,13 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
   input("ocr").value = String(getPref("ocrMode") || "auto");
   input("images").checked = getPref("imageAnalysis") !== false;
   input("pages").value = String(getPref("pageRange") || "all");
-  const configPath = () => effectiveConfigPath(config.value.trim());
-  const showEffective = () => {
-    effective.textContent = `${getString("effective-config")}: ${configPath()}`;
+  const configPath = () => resolveCurrentMineruConfigPath(config.value.trim());
+  let displayRequest = 0;
+  const showEffective = async () => {
+    const request = ++displayRequest;
+    const path = await configPath();
+    if (request === displayRequest)
+      effective.textContent = `${getString("effective-config")}: ${path}`;
   };
   const checkRuntime = async () => {
     const path = runtime.value.trim() || defaultRuntimeDescriptorPath();
@@ -66,7 +57,7 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
   });
   config.addEventListener("change", () => {
     setPref("configPath", config.value.trim());
-    showEffective();
+    void showEffective();
   });
   const button = (id: string, fn: () => void | Promise<void>) => {
     doc.getElementById(`mineru-${id}`)?.addEventListener("command", () => {
@@ -99,12 +90,12 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
     if (path) {
       config.value = path;
       setPref("configPath", path);
-      showEffective();
+      await showEffective();
     }
   });
-  button("config-open", () => openFile(win, configPath()));
+  button("config-open", async () => openFile(win, await configPath()));
   button("config-create", async () => {
-    const path = configPath();
+    const path = await configPath();
     try {
       if (!(await IOUtils.exists(path))) {
         await IOUtils.makeDirectory(PathUtils.parent(path) || "/", {
@@ -120,7 +111,7 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
   button("config-reset", () => {
     clearPref("configPath");
     config.value = "";
-    showEffective();
+    void showEffective();
   });
   for (const [id, key] of [
     ["tier", "tier"],
@@ -138,6 +129,6 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
   input("images").addEventListener("change", () =>
     setPref("imageAnalysis", input("images").checked),
   );
-  showEffective();
+  await showEffective();
   await checkRuntime();
 }

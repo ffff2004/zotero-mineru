@@ -103,6 +103,29 @@ async function localUserHomes(home: string): Promise<Record<string, string>> {
   return homes;
 }
 
+/** Resolve against the Zotero process context used by Preferences and tasks. */
+export async function resolveCurrentMineruConfigPath(
+  customPath?: string | null,
+  environment: { MINERU_CONFIG?: string; MINERU_HOME?: string } = {
+    MINERU_CONFIG: Services.env.get("MINERU_CONFIG"),
+    MINERU_HOME: Services.env.get("MINERU_HOME"),
+  },
+): Promise<string> {
+  const home = Services.dirsvc.get("Home", Components.interfaces.nsIFile).path;
+  const workingDirectory = Services.dirsvc.get(
+    "CurWorkD",
+    Components.interfaces.nsIFile,
+  ).path;
+  return resolveMineruConfigPath({
+    customPath,
+    inheritedConfig: environment.MINERU_CONFIG,
+    mineruHome: environment.MINERU_HOME,
+    home,
+    workingDirectory,
+    userHomes: await localUserHomes(home),
+  });
+}
+
 function isFile(path: string): boolean {
   try {
     return Zotero.File.pathToFile(path).isFile();
@@ -212,23 +235,10 @@ export async function freezeRuntime(
   } = {},
 ): Promise<RuntimeSnapshot> {
   const descriptor = await readCompatibleRuntime(options.descriptorPath);
-  const env = options.environment ?? {
-    MINERU_CONFIG: Services.env.get("MINERU_CONFIG"),
-    MINERU_HOME: Services.env.get("MINERU_HOME"),
-  };
-  const home = Services.dirsvc.get("Home", Components.interfaces.nsIFile).path;
-  const workingDirectory = Services.dirsvc.get(
-    "CurWorkD",
-    Components.interfaces.nsIFile,
-  ).path;
-  const configPath = resolveMineruConfigPath({
-    customPath: options.customConfigPath,
-    inheritedConfig: env.MINERU_CONFIG,
-    mineruHome: env.MINERU_HOME,
-    home,
-    workingDirectory,
-    userHomes: await localUserHomes(home),
-  });
+  const configPath = await resolveCurrentMineruConfigPath(
+    options.customConfigPath,
+    options.environment,
+  );
   return {
     descriptor,
     configPath,
