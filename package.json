@@ -23,12 +23,14 @@
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "start": "zotero-plugin serve",
-    "build": "zotero-plugin build && tsc --noEmit",
+    "build": "zotero-plugin build && tsc --noEmit && pnpm run build:runtime-installer",
+    "build:runtime-installer": "node scripts/build_runtime_installer.mjs",
     "lint:check": "prettier --check . && eslint .",
     "lint:fix": "prettier --write . && eslint . --fix",
     "release": "zotero-plugin release",
     "test": "zotero-plugin test",
     "test:helper": "uv run --no-project --with pymupdf python -B -m unittest discover -s skills/zotero-mineru/tests -v",
+    "test:runtime-installer": "uv run --no-project python -B -m unittest discover -s scripts/tests -v",
     "update-deps": "pnpm update"
   },
   "dependencies": {

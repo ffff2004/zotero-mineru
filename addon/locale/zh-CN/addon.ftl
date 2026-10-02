@@ -20,7 +20,7 @@ config-create-failed = 无法创建配置文件。请检查目录权限。
 effective-config = 当前有效配置路径
 runtime-ready = 兼容的运行环境
 runtime-unavailable = 运行环境缺失或不兼容。
-runtime-repair = 请在发行版本 { $release } 的配套源码目录中运行：
+runtime-repair = 请运行以下命令安装配套 runtime 版本 { $release }：
     { $command }
     然后选择安装的运行时描述文件：{ $descriptor }
 plugin-log = 插件日志

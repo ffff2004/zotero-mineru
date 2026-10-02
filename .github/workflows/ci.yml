@@ -17,6 +17,15 @@ jobs:
       - name: Test skill helper
         run: uv run --no-project --with pymupdf python -B -m unittest discover -s skills/zotero-mineru/tests -v
 
+  runtime-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup JS
+        uses: zotero-plugin-dev/workflows/setup-js@main
+      - uses: astral-sh/setup-uv@v6
+      - name: Test runtime installer
+        run: pnpm run test:runtime-installer
+
   lint:
     runs-on: ubuntu-latest
     env:

@@ -40,14 +40,16 @@ and journaled multifile stored-attachment publication.
 Use Node.js 24 and the pnpm version pinned in `package.json`. Commit
 `pnpm-lock.yaml` when changing dependencies.
 
-| Command                                                                                        | Purpose                                                         |
-| ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `pnpm install --frozen-lockfile`                                                               | Install the locked dependencies                                 |
-| `pnpm start`                                                                                   | Start Zotero with the plugin and watch source changes           |
-| `pnpm build`                                                                                   | Build the XPI in `.scaffold/build/` and run TypeScript checking |
-| `pnpm lint:check`                                                                              | Check Prettier formatting and ESLint rules                      |
-| `pnpm run test --no-watch`                                                                     | Run the Zotero integration tests once                           |
-| `uv run --no-project --with pymupdf python -m unittest discover -s skills/zotero-mineru/tests` | Run helper HTTP, matching and PDF rendering tests               |
+| Command                                                                                        | Purpose                                                                                              |
+| ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `pnpm install --frozen-lockfile`                                                               | Install the locked dependencies                                                                      |
+| `pnpm start`                                                                                   | Start Zotero with the plugin and watch source changes                                                |
+| `pnpm build`                                                                                   | Build the XPI, standalone runtime installer and checksum in `.scaffold/build/`, and check TypeScript |
+| `pnpm build:runtime-installer`                                                                 | Build only the standalone runtime installer and checksum                                             |
+| `pnpm lint:check`                                                                              | Check Prettier formatting and ESLint rules                                                           |
+| `pnpm run test --no-watch`                                                                     | Run the Zotero integration tests once                                                                |
+| `pnpm test:runtime-installer`                                                                  | Test installer generation, standalone installation and failed upgrade recovery                       |
+| `uv run --no-project --with pymupdf python -m unittest discover -s skills/zotero-mineru/tests` | Run helper HTTP, matching and PDF rendering tests                                                    |
 
 The `zotero-types` Git dependency invokes npm during preparation, so installation
 also needs npm available.

@@ -4,8 +4,28 @@ This release combination pins official PyPI `mineru` 4.0.10 and `docvortex`
 0.5.7 with CPython 3.13.12. The hash-locked dependency sets target glibc 2.34
 or newer. The source and wheel hashes are in `release.json`.
 
-After the final production build, generate and verify both checksum files from
-the repository root:
+Download `install-runtime.py` and `install-runtime.py.sha256` from the same
+GitHub Release as your plugin. The installer embeds the manifest and both
+dependency locks; it runs from any directory with uv installed, without a
+source checkout. Verify the download and install the CPU profile:
+
+```sh
+sha256sum -c install-runtime.py.sha256
+uv run --no-project install-runtime.py install --profile cpu
+```
+
+For source builds, `pnpm build` also generates `.scaffold/build/install-runtime.py`
+and `install-runtime.py.sha256`. `pnpm build:runtime-installer` generates only
+these two files using Node.js. The build validates the plugin identity and lock
+hashes and embeds their exact contents. Release CI uploads both files beside
+the XPI. To verify the built installer:
+
+```sh
+(cd .scaffold/build && sha256sum -c install-runtime.py.sha256)
+```
+
+Maintainers can additionally generate and verify the tracked source checksums
+and XPI checksum after the final production build:
 
 ```sh
 pnpm build
@@ -14,17 +34,11 @@ sha256sum -c runtime/SHA256SUMS
 (cd .scaffold/build && sha256sum -c XPI-SHA256SUMS)
 ```
 
-Commit `runtime/SHA256SUMS` with the stable companion distribution files. Ship
-`.scaffold/build/XPI-SHA256SUMS` beside `zotero-miner-u.xpi` as a release
-artifact. The XPI checksum is generated at release time because the build embeds
+Commit `runtime/SHA256SUMS` with the stable companion source files. If distributing
+the XPI checksum, upload `.scaffold/build/XPI-SHA256SUMS` beside
+`zotero-miner-u.xpi`. The XPI checksum is generated after building because the build embeds
 a changing build timestamp; rebuild the XPI only before regenerating its
 checksum.
-
-Install the CPU profile with:
-
-```sh
-uv run --no-project python scripts/install_runtime.py install --profile cpu
-```
 
 The NVIDIA profile adds MinerU's published `torch` extra, currently locking
 PyTorch 2.14.0 and its CUDA 13 dependencies. It requires a compatible NVIDIA
@@ -32,11 +46,11 @@ driver and has a substantially larger download. Device and model choices remain
 in the MinerU config.
 
 ```sh
-uv run --no-project python scripts/install_runtime.py install --profile nvidia
+uv run --no-project install-runtime.py install --profile nvidia
 ```
 
-For an upgrade, distribute a new manifest and lock files under a new release
-ID, then run `uv run --no-project python scripts/install_runtime.py upgrade
+For an upgrade, download the installer and checksum from the new plugin
+Release, verify it, then run `uv run --no-project install-runtime.py upgrade
 --profile cpu` (or `nvidia`). The new environment has its own directory under
 `${XDG_DATA_HOME:-$HOME/.local/share}/zotero-mineru/environments/`. The active
 descriptor is `runtime.json` in the parent directory. Installation and

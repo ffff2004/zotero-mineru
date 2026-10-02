@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
 """Install an immutable, hash-locked companion environment and publish its descriptor."""
 
 from __future__ import annotations
@@ -17,19 +21,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "runtime" / "release.json"
+# The build replaces these declarations with this release's distribution data.
+EMBEDDED_MANIFEST: str | None = None
+EMBEDDED_LOCKS: dict[str, str] | None = None
 
 
 def check(command: list[str]) -> str:
     result = subprocess.run(command, check=True, text=True, capture_output=True)
     return result.stdout
-
-
-def digest(path: Path) -> str:
-    sha = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            sha.update(chunk)
-    return sha.hexdigest()
 
 
 def installed(python: Path, cli: Path, manifest: dict) -> dict:
@@ -73,14 +72,18 @@ def main() -> None:
     parser.add_argument("--profile", choices=("cpu", "nvidia"), default="cpu")
     parser.add_argument("--data-home", type=Path, help="Test or portable data directory override")
     args = parser.parse_args()
-    manifest = json.loads(MANIFEST.read_text())
+    manifest = json.loads(EMBEDDED_MANIFEST if EMBEDDED_MANIFEST is not None else MANIFEST.read_text(encoding="utf-8"))
     if sys.platform != "linux" or platform.machine() != "x86_64":
         raise RuntimeError("This lock supports Linux x86_64 only")
     libc, libc_version = platform.libc_ver()
     if libc != "glibc" or tuple(map(int, libc_version.split(".")[:2])) < (2, 34):
         raise RuntimeError("This lock requires glibc 2.34 or newer")
-    lock = ROOT / "runtime" / manifest["profiles"][args.profile]["lock"]
-    if digest(lock) != manifest["profiles"][args.profile]["sha256"]:
+    lock_bytes = (
+        EMBEDDED_LOCKS[args.profile].encode("utf-8")
+        if EMBEDDED_LOCKS is not None
+        else (ROOT / "runtime" / manifest["profiles"][args.profile]["lock"]).read_bytes()
+    )
+    if hashlib.sha256(lock_bytes).hexdigest() != manifest["profiles"][args.profile]["sha256"]:
         raise RuntimeError("Release lock checksum mismatch")
     data_home = args.data_home or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "zotero-mineru"
     data_home = data_home.expanduser().resolve()
@@ -93,7 +96,10 @@ def main() -> None:
         # must be installed at its permanent path; only the descriptor moves.
         staged = final
         check(["uv", "venv", "--python", manifest["python_version"], "--managed-python", str(staged)])
-        check(["uv", "pip", "sync", "--python", str(staged / "bin/python"), "--require-hashes", str(lock)])
+        with tempfile.TemporaryDirectory(prefix="mineru-lock-") as directory:
+            lock = Path(directory) / manifest["profiles"][args.profile]["lock"]
+            lock.write_bytes(lock_bytes)
+            check(["uv", "pip", "sync", "--python", str(staged / "bin/python"), "--require-hashes", str(lock)])
         actual = installed(final / "bin/python", final / "bin/mineru-kit", manifest)
         descriptor = {
             "schema_version": 1,

@@ -6,9 +6,11 @@ The companion release targets Linux x86_64, Zotero 10, Python 3.13.12, MinerU 4.
 
 ## Install
 
-1. Build the plugin with Node.js 24 and pnpm 11.25.0: `pnpm install --frozen-lockfile && pnpm build`. Install the resulting `.scaffold/build/*.xpi` in Zotero using Tools → Plugins → Install Plugin From File.
-2. Install the companion environment with `uv run --no-project python scripts/install_runtime.py install --profile cpu` from this checkout. For NVIDIA, use `--profile nvidia`. The installer uses a dedicated directory under `${XDG_DATA_HOME:-$HOME/.local/share}/zotero-mineru/` and atomically updates `runtime.json` after verification. It does not edit system Python or existing environments. See [runtime/README.md](runtime/README.md) for upgrade instructions and checksums.
+1. Download the XPI from the matching [GitHub Release](https://github.com/ffff2004/zotero-mineru/releases). Install it in Zotero using Tools → Plugins → Install Plugin From File.
+2. Download `install-runtime.py` and `install-runtime.py.sha256` from the same Release. In the download directory, verify with `sha256sum -c install-runtime.py.sha256`, then install with `uv run --no-project install-runtime.py install --profile cpu`. For NVIDIA, use `--profile nvidia`. The script includes the release manifest and dependency locks and runs independently of a source checkout. The installer uses a dedicated directory under `${XDG_DATA_HOME:-$HOME/.local/share}/zotero-mineru/` and atomically updates `runtime.json` after verification. It does not edit system Python or existing environments. See [runtime/README.md](runtime/README.md) for upgrade instructions and checksums.
 3. Prepare MinerU models according to your configuration. The first parse may download model files and require network access. Parsing never installs Python packages. The NVIDIA profile can require substantial disk space.
+
+To build from source, use Node.js 24 and pnpm 11.25.0: `pnpm install --frozen-lockfile && pnpm build`. The build produces the XPI, standalone `install-runtime.py`, and its checksum in `.scaffold/build/`. To generate only the installer, run `pnpm build:runtime-installer`. Python packages and models are downloaded when installing or parsing, rather than during this build.
 
 ## Configure
 

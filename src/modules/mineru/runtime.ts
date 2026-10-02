@@ -1,6 +1,7 @@
 /** Companion runtime descriptor, installed package checks, and task config path. */
 
 import manifest from "../../../runtime/release.json";
+import pkg from "../../../package.json";
 
 type PackageRecord = { version: string; metadata_path: string };
 
@@ -80,7 +81,7 @@ export class RuntimeCompatibilityError extends Error {
   }
 }
 
-/** Run from the companion checkout for this manifest's release. */
+/** Run the standalone installer from the matching plugin release. */
 export function companionRepairCommand(
   descriptorPath: string,
   error: unknown,
@@ -91,7 +92,8 @@ export function companionRepairCommand(
     absolute(descriptorPath) ? descriptorPath : defaultRuntimeDescriptorPath(),
   );
   const quotedHome = `'${dataHome.replace(/'/g, "'\\''")}'`;
-  return `uv run --no-project python scripts/install_runtime.py install --profile ${profile} --data-home ${quotedHome}`;
+  const installer = `${pkg.homepage.split("#")[0]}/releases/download/v${manifest.plugin.version}/install-runtime.py`;
+  return `uv run --no-project ${installer} install --profile ${profile} --data-home ${quotedHome}`;
 }
 
 export const companionReleaseID = manifest.release_id;

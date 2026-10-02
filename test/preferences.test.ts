@@ -1,5 +1,5 @@
 import { assert } from "chai";
-import { config } from "../package.json";
+import { config, homepage } from "../package.json";
 import { registerPrefsScripts } from "../src/modules/preferenceScript";
 import { freezeRuntime } from "../src/modules/mineru/runtime";
 import manifest from "../runtime/release.json";
@@ -209,7 +209,7 @@ describe("MinerU Preferences", function () {
       assert.include(status.textContent!, manifest.release_id);
       assert.include(
         status.textContent!,
-        `uv run --no-project python scripts/install_runtime.py install --profile nvidia --data-home '${root}'`,
+        `uv run --no-project ${homepage.split("#")[0]}/releases/download/v${manifest.plugin.version}/install-runtime.py install --profile nvidia --data-home '${root}'`,
       );
       assert.include(status.textContent!, descriptorPath);
       await IOUtils.writeUTF8(runtime.mineru_kit, "fixture");

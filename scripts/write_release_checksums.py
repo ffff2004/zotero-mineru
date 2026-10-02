@@ -16,6 +16,7 @@ COMPANION_FILES = (
     "runtime/requirements-nvidia.lock",
     "runtime/README.md",
     "scripts/install_runtime.py",
+    "scripts/build_runtime_installer.mjs",
     "scripts/write_release_checksums.py",
 )
 XPI = ROOT / ".scaffold" / "build" / "zotero-miner-u.xpi"

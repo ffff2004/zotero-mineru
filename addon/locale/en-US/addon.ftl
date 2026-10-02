@@ -20,7 +20,7 @@ config-create-failed = Could not create the configuration file. Check the direct
 effective-config = Effective configuration path
 runtime-ready = Compatible runtime
 runtime-unavailable = Runtime missing or incompatible.
-runtime-repair = From the companion checkout for release { $release }, run:
+runtime-repair = To install companion release { $release }, run:
     { $command }
     Then select the installed descriptor: { $descriptor }
 plugin-log = Plugin log

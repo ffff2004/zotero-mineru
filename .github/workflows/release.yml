@@ -17,5 +17,7 @@ jobs:
     # If you omit an input, its default value will be used.
     with:
       build: "pnpm run build"
-      release: "pnpm run release"
+      release: |
+        pnpm run release
+        gh release upload "$GITHUB_REF_NAME" .scaffold/build/install-runtime.py .scaffold/build/install-runtime.py.sha256 --clobber
     secrets: inherit
