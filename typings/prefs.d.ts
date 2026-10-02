@@ -7,8 +7,12 @@
 declare namespace _ZoteroTypes {
   interface Prefs {
     PluginPrefsMap: {
-      "enable": boolean;
-      "input": string;
+      "runtimeDescriptor": string;
+      "configPath": string;
+      "tier": string;
+      "ocrMode": string;
+      "imageAnalysis": boolean;
+      "pageRange": string;
     };
   }
 }

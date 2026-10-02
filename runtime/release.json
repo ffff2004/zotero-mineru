@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "release_id": "mineru-4.0.10-docvortex-0.5.7-py313-linux-x86_64-r1",
+  "plugin": {
+    "id": "zotero-mineru@ffff2004",
+    "version": "0.1.0"
+  },
+  "platform": "linux-x86_64-glibc>=2.34",
+  "python_version": "3.13.12",
+  "packages": {
+    "mineru": {
+      "version": "4.0.10",
+      "source": "https://pypi.org/project/mineru/4.0.10/",
+      "wheel": "mineru-4.0.10-py3-none-any.whl",
+      "sha256": "9731eb8afb9756bb2e3a8e3e6a69252786434602eeb4ff36f7e7a5f2aa8ac107"
+    },
+    "docvortex": {
+      "version": "0.5.7",
+      "source": "https://pypi.org/project/docvortex/0.5.7/",
+      "wheel": "docvortex-0.5.7-cp310-abi3-manylinux_2_28_x86_64.whl",
+      "sha256": "c2e81bd50379fc9188437f351356eef0ca44342bd75823bea1db4df6a694d83e"
+    }
+  },
+  "profiles": {
+    "cpu": {
+      "lock": "requirements-cpu.lock",
+      "sha256": "2ab046ffa0dd04a8c18ee80e153f52b10416c32ed18806ccdcc9b26f6ba135fa"
+    },
+    "nvidia": {
+      "lock": "requirements-nvidia.lock",
+      "sha256": "3274a10fd9464046fda267a2d1fcbbbcb676540e2fbece94ede6fb3092e3cf61"
+    }
+  },
+  "compatibility": {
+    "cli": "mineru-kit parse",
+    "required_arguments": [
+      "--output",
+      "--format",
+      "--tier",
+      "--ocr-mode",
+      "--pages",
+      "--disable-image-analysis"
+    ],
+    "export_format": "zip",
+    "required_root_files": ["markdown.md", "middle_json.json"],
+    "middle_json_schema": {
+      "schema": "docvortex.middle",
+      "schema_version": "2.0"
+    }
+  }
+}

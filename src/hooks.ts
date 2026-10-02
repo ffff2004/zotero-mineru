@@ -1,197 +1,134 @@
-import {
-  BasicExampleFactory,
-  HelperExampleFactory,
-  KeyExampleFactory,
-  PromptExampleFactory,
-  UIExampleFactory,
-} from "./modules/examples";
 import { getString, initLocale } from "./utils/locale";
+import { getPref } from "./utils/prefs";
 import { registerPrefsScripts } from "./modules/preferenceScript";
-import { createZToolkit } from "./utils/ztoolkit";
+import { recoverIncompletePublications } from "./modules/mineru/publication";
+import { MineruTaskController } from "./modules/mineru/task";
+import { closeTaskWindows, createTaskWindow } from "./modules/mineru/ui";
+import type { ParseOptions } from "./modules/mineru/package";
 
-async function onStartup() {
+const task = new MineruTaskController();
+
+function setting(
+  key:
+    | "runtimeDescriptor"
+    | "configPath"
+    | "tier"
+    | "ocrMode"
+    | "imageAnalysis"
+    | "pageRange",
+): string {
+  return String(getPref(key) ?? "");
+}
+
+function taskOptions(): ParseOptions {
+  return {
+    tier: (setting("tier") || "standard") as ParseOptions["tier"],
+    ocr_mode: (setting("ocrMode") || "auto") as ParseOptions["ocr_mode"],
+    image_analysis: getPref("imageAnalysis") !== false,
+    page_range: setting("pageRange") || "all",
+  };
+}
+
+async function choosePDF(
+  win: Window,
+  pdfs: Zotero.Item[],
+): Promise<Zotero.Item | undefined> {
+  const choices = pdfs.map(
+    (pdf) => `${pdf.getField("title")} — ${pdf.attachmentFilename || ""}`,
+  );
+  const selected = { value: 0 };
+  const accepted = Services.prompt.select(
+    win as mozIDOMWindowProxy,
+    getString("task-title"),
+    getString("choose-pdf"),
+    choices,
+    selected,
+  );
+  return accepted ? pdfs[selected.value] : undefined;
+}
+
+async function runFromWindow(win: _ZoteroTypes.MainWindow): Promise<void> {
+  if (task.busy) {
+    win.alert(getString("already-running"));
+    return;
+  }
+  const items = (win as any).ZoteroPane.getSelectedItems() as Zotero.Item[];
+  const view = createTaskWindow();
+  await task.run(
+    items,
+    (pdfs) => choosePDF(win, pdfs),
+    {
+      descriptorPath: setting("runtimeDescriptor"),
+      customConfigPath: setting("configPath"),
+      options: taskOptions(),
+    },
+    view,
+  );
+}
+
+async function onStartup(): Promise<void> {
   await Promise.all([
     Zotero.initializationPromise,
     Zotero.unlockPromise,
     Zotero.uiReadyPromise,
   ]);
-
   initLocale();
-
-  BasicExampleFactory.registerPrefs();
-
-  BasicExampleFactory.registerNotifier();
-
-  KeyExampleFactory.registerShortcuts();
-
-  await UIExampleFactory.registerExtraColumn();
-
-  await UIExampleFactory.registerExtraColumnWithCustomCell();
-
-  UIExampleFactory.registerItemPaneCustomInfoRow();
-
-  UIExampleFactory.registerItemPaneSection();
-
-  UIExampleFactory.registerReaderItemPaneSection();
-
-  await Promise.all(
-    Zotero.getMainWindows().map((win) => onMainWindowLoad(win)),
-  );
-
-  // Mark initialized as true to confirm plugin loading status
-  // outside of the plugin (e.g. scaffold testing process)
+  Zotero.PreferencePanes.register({
+    pluginID: addon.data.config.addonID,
+    src: rootURI + "content/preferences.xhtml",
+    label: getString("prefs-title"),
+    image: `chrome://${addon.data.config.addonRef}/content/icons/favicon.png`,
+  });
+  try {
+    await recoverIncompletePublications();
+  } catch (error) {
+    Zotero.logError(error as Error);
+    new ztoolkit.ProgressWindow(addon.data.config.addonName)
+      .createLine({ text: getString("recovery-failed"), type: "fail" })
+      .show();
+  }
+  for (const win of Zotero.getMainWindows()) await onMainWindowLoad(win);
   addon.data.initialized = true;
 }
 
 async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
-  // Create ztoolkit for every window
-  addon.data.ztoolkit = createZToolkit();
-
   win.MozXULElement.insertFTLIfNeeded(
     `${addon.data.config.addonRef}-mainWindow.ftl`,
   );
-
-  const popupWin = new ztoolkit.ProgressWindow(addon.data.config.addonName, {
-    closeOnClick: true,
-    closeTime: -1,
-  })
-    .createLine({
-      text: getString("startup-begin"),
-      type: "default",
-      progress: 0,
-    })
-    .show();
-
-  await Zotero.Promise.delay(1000);
-  popupWin.changeLine({
-    progress: 30,
-    text: `[30%] ${getString("startup-begin")}`,
+  ztoolkit.Menu.register("item", {
+    tag: "menuitem",
+    id: `zotero-itemmenu-${addon.data.config.addonRef}-run`,
+    label: getString("run-mineru"),
+    commandListener: () => {
+      void runFromWindow(win);
+    },
   });
-
-  UIExampleFactory.registerStyleSheet(win);
-
-  UIExampleFactory.registerRightClickMenuItem();
-
-  UIExampleFactory.registerRightClickMenuPopup(win);
-
-  UIExampleFactory.registerWindowMenuWithSeparator();
-
-  PromptExampleFactory.registerNormalCommandExample();
-
-  PromptExampleFactory.registerAnonymousCommandExample(win);
-
-  PromptExampleFactory.registerConditionalCommandExample();
-
-  await Zotero.Promise.delay(1000);
-
-  popupWin.changeLine({
-    progress: 100,
-    text: `[100%] ${getString("startup-finish")}`,
-  });
-  popupWin.startCloseTimer(5000);
-
-  addon.hooks.onDialogEvents("dialogExample");
 }
 
-async function onMainWindowUnload(win: Window): Promise<void> {
-  ztoolkit.unregisterAll();
-  addon.data.dialog?.window?.close();
+async function onMainWindowUnload(_win: Window): Promise<void> {
+  // Menu registration belongs to the plugin instance and is cleared on shutdown.
 }
 
 function onShutdown(): void {
-  ztoolkit.unregisterAll();
-  addon.data.dialog?.window?.close();
-  // Remove addon object
+  task.shutdown();
+  closeTaskWindows();
   addon.data.alive = false;
-  // @ts-expect-error - Plugin instance is not typed
+  ztoolkit.unregisterAll();
+  // @ts-expect-error Plugin instance is not typed
   delete Zotero[addon.data.config.addonInstance];
 }
 
-/**
- * This function is just an example of dispatcher for Notify events.
- * Any operations should be placed in a function to keep this funcion clear.
- */
-async function onNotify(
-  event: string,
+async function onPrefsEvent(
   type: string,
-  ids: Array<string | number>,
-  extraData: { [key: string]: any },
-) {
-  // You can add your code to the corresponding notify type
-  ztoolkit.log("notify", event, type, ids, extraData);
-  if (
-    event == "select" &&
-    type == "tab" &&
-    extraData[ids[0]].type == "reader"
-  ) {
-    BasicExampleFactory.exampleNotifierCallback();
-  } else {
-    return;
-  }
+  data: { window: Window },
+): Promise<void> {
+  if (type === "load") await registerPrefsScripts(data.window);
 }
-
-/**
- * This function is just an example of dispatcher for Preference UI events.
- * Any operations should be placed in a function to keep this funcion clear.
- * @param type event type
- * @param data event data
- */
-async function onPrefsEvent(type: string, data: { [key: string]: any }) {
-  switch (type) {
-    case "load":
-      registerPrefsScripts(data.window);
-      break;
-    default:
-      return;
-  }
-}
-
-function onShortcuts(type: string) {
-  switch (type) {
-    case "larger":
-      KeyExampleFactory.exampleShortcutLargerCallback();
-      break;
-    case "smaller":
-      KeyExampleFactory.exampleShortcutSmallerCallback();
-      break;
-    default:
-      break;
-  }
-}
-
-function onDialogEvents(type: string) {
-  switch (type) {
-    case "dialogExample":
-      HelperExampleFactory.dialogExample();
-      break;
-    case "clipboardExample":
-      HelperExampleFactory.clipboardExample();
-      break;
-    case "filePickerExample":
-      HelperExampleFactory.filePickerExample();
-      break;
-    case "progressWindowExample":
-      HelperExampleFactory.progressWindowExample();
-      break;
-    case "vtableExample":
-      HelperExampleFactory.vtableExample();
-      break;
-    default:
-      break;
-  }
-}
-
-// Add your hooks here. For element click, etc.
-// Keep in mind hooks only do dispatch. Don't add code that does real jobs in hooks.
-// Otherwise the code would be hard to read and maintain.
 
 export default {
   onStartup,
   onShutdown,
   onMainWindowLoad,
   onMainWindowUnload,
-  onNotify,
   onPrefsEvent,
-  onShortcuts,
-  onDialogEvents,
 };

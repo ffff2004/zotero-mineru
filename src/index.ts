@@ -4,6 +4,12 @@ import { config } from "../package.json";
 
 const basicTool = new BasicTool();
 
+// Bootstrap sandboxes do not provide this window constructor on Zotero 10.
+defineGlobal(
+  "AbortController",
+  () => basicTool.getGlobal("window").AbortController,
+);
+
 // @ts-expect-error - Plugin instance is not typed
 if (!basicTool.getGlobal("Zotero")[config.addonInstance]) {
   _globalThis.addon = new Addon();

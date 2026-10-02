@@ -40,6 +40,7 @@ export default defineConfig({
   },
 
   test: {
+    startupDelay: 15000,
     waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`,
   },
 
