@@ -77,3 +77,8 @@ also needs npm available.
 ## Issue tracker
 
 Issues live in GitHub Issues; use the `gh` CLI.
+
+## Release
+
+For version bumps, release publication or failed release recovery, use
+[release-zotero-mineru](.agents/skills/release-zotero-mineru/SKILL.md).
