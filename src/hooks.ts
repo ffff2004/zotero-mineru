@@ -1,33 +1,14 @@
 import { getString, initLocale } from "./utils/locale";
-import { getPref } from "./utils/prefs";
 import { registerPrefsScripts } from "./modules/preferenceScript";
 import { recoverIncompletePublications } from "./modules/mineru/publication";
-import { MineruTaskController } from "./modules/mineru/task";
+import { resolveSelectedPDF } from "./modules/mineru/task";
+import { mineruService } from "./modules/mineru/service";
+import { registerLocalAPI } from "./modules/mineru/localAPI";
+import { currentTaskSettings } from "./modules/mineru/settings";
+import { readCompatibleRuntime } from "./modules/mineru/runtime";
+import { safeDiagnostic } from "./modules/mineru/pluginLog";
 import { closeTaskWindows, createTaskWindow } from "./modules/mineru/ui";
-import type { ParseOptions } from "./modules/mineru/package";
-
-const task = new MineruTaskController();
-
-function setting(
-  key:
-    | "runtimeDescriptor"
-    | "configPath"
-    | "tier"
-    | "ocrMode"
-    | "imageAnalysis"
-    | "pageRange",
-): string {
-  return String(getPref(key) ?? "");
-}
-
-function taskOptions(): ParseOptions {
-  return {
-    tier: (setting("tier") || "standard") as ParseOptions["tier"],
-    ocr_mode: (setting("ocrMode") || "auto") as ParseOptions["ocr_mode"],
-    image_analysis: getPref("imageAnalysis") !== false,
-    page_range: setting("pageRange") || "all",
-  };
-}
+let unregisterAPI: (() => void) | undefined;
 
 async function choosePDF(
   win: Window,
@@ -48,22 +29,47 @@ async function choosePDF(
 }
 
 async function runFromWindow(win: _ZoteroTypes.MainWindow): Promise<void> {
-  if (task.busy) {
+  if (mineruService.busy) {
     win.alert(getString("already-running"));
     return;
   }
   const items = (win as any).ZoteroPane.getSelectedItems() as Zotero.Item[];
   const view = createTaskWindow();
-  await task.run(
-    items,
-    (pdfs) => choosePDF(win, pdfs),
-    {
-      descriptorPath: setting("runtimeDescriptor"),
-      customConfigPath: setting("configPath"),
-      options: taskOptions(),
-    },
-    view,
-  );
+  try {
+    // Preserve the menu's runtime-first readiness check before opening a chooser.
+    const settings = currentTaskSettings();
+    try {
+      await readCompatibleRuntime(settings.descriptorPath || undefined);
+    } catch (error) {
+      throw new Error(
+        "MinerU runtime is missing or incompatible; run the companion installer",
+        { cause: error },
+      );
+    }
+    const source = await resolveSelectedPDF(items, (pdfs) =>
+      choosePDF(win, pdfs),
+    );
+    await mineruService.submit(
+      {
+        requestID: crypto.randomUUID(),
+        source: { libraryID: source.libraryID, itemKey: source.key },
+      },
+      view,
+    );
+  } catch (error) {
+    view({
+      phase: "failed",
+      state: "failed",
+      message: (error as Error).message,
+      record: {
+        timestamp: new Date().toISOString(),
+        stage: "task",
+        event: "failure",
+        message: (error as Error).message,
+        details: safeDiagnostic(error),
+      },
+    });
+  }
 }
 
 async function onStartup(): Promise<void> {
@@ -79,14 +85,19 @@ async function onStartup(): Promise<void> {
     label: getString("prefs-title"),
     image: `chrome://${addon.data.config.addonRef}/content/icons/favicon.png`,
   });
+  let recoveryReady = true;
   try {
     await recoverIncompletePublications();
   } catch (error) {
+    recoveryReady = false;
     Zotero.logError(error as Error);
     new ztoolkit.ProgressWindow(addon.data.config.addonName)
       .createLine({ text: getString("recovery-failed"), type: "fail" })
       .show();
   }
+  mineruService.setReady(recoveryReady);
+  unregisterAPI = registerLocalAPI();
+  addon.api = mineruService;
   for (const win of Zotero.getMainWindows()) await onMainWindowLoad(win);
   addon.data.initialized = true;
 }
@@ -110,7 +121,9 @@ async function onMainWindowUnload(_win: Window): Promise<void> {
 }
 
 function onShutdown(): void {
-  task.shutdown();
+  unregisterAPI?.();
+  unregisterAPI = undefined;
+  mineruService.shutdown();
   closeTaskWindows();
   addon.data.alive = false;
   ztoolkit.unregisterAll();

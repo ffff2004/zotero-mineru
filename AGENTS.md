@@ -23,6 +23,7 @@ and journaled multifile stored-attachment publication.
 |-- addon/                   # Bootstrap, manifest, UI, locales, and assets
 |-- typings/                 # Global TypeScript declarations
 |-- test/                    # Tests running inside Zotero
+|-- skills/zotero-mineru/     # Agent workflow, Python helper and helper tests
 |-- package.json             # Plugin identity, metadata, and scripts
 |-- pnpm-workspace.yaml      # Dependency compatibility and build permissions
 |-- zotero-plugin.config.ts  # Build, serve, and test configuration
@@ -39,13 +40,14 @@ and journaled multifile stored-attachment publication.
 Use Node.js 24 and the pnpm version pinned in `package.json`. Commit
 `pnpm-lock.yaml` when changing dependencies.
 
-| Command                          | Purpose                                                         |
-| -------------------------------- | --------------------------------------------------------------- |
-| `pnpm install --frozen-lockfile` | Install the locked dependencies                                 |
-| `pnpm start`                     | Start Zotero with the plugin and watch source changes           |
-| `pnpm build`                     | Build the XPI in `.scaffold/build/` and run TypeScript checking |
-| `pnpm lint:check`                | Check Prettier formatting and ESLint rules                      |
-| `pnpm run test --no-watch`       | Run the Zotero integration tests once                           |
+| Command                                                                                        | Purpose                                                         |
+| ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `pnpm install --frozen-lockfile`                                                               | Install the locked dependencies                                 |
+| `pnpm start`                                                                                   | Start Zotero with the plugin and watch source changes           |
+| `pnpm build`                                                                                   | Build the XPI in `.scaffold/build/` and run TypeScript checking |
+| `pnpm lint:check`                                                                              | Check Prettier formatting and ESLint rules                      |
+| `pnpm run test --no-watch`                                                                     | Run the Zotero integration tests once                           |
+| `uv run --no-project --with pymupdf python -m unittest discover -s skills/zotero-mineru/tests` | Run helper HTTP, matching and PDF rendering tests               |
 
 The `zotero-types` Git dependency invokes npm during preparation, so installation
 also needs npm available.
@@ -54,6 +56,12 @@ also needs npm available.
 
 - Test each module through its public interface and assert observable behavior. Keep private helpers private; do not import, expose, or mock them for tests.
 - Use test doubles only at external boundaries. Exercise internal collaborating modules with their real implementations.
+
+- The menu and local HTTP API share one MinerU task service. Endpoint prefixes
+  come from `package.json` config; HTTP requests identify Zotero items by library
+  ID and item key. See `docs/local-api.md` for the protocol. Task records are
+  session-local; published results and publication recovery journals survive
+  restarts.
 
 - Integration tests exercise the plugin instance and MinerU public module interfaces.
   Set `ZOTERO_PLUGIN_ZOTERO_BIN_PATH` using `.env.example`. Tests use a disposable

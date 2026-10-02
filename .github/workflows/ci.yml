@@ -9,6 +9,14 @@ on:
       - main
 
 jobs:
+  helper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Test skill helper
+        run: uv run --no-project --with pymupdf python -B -m unittest discover -s skills/zotero-mineru/tests -v
+
   lint:
     runs-on: ubuntu-latest
     env:

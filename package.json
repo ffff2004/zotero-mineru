@@ -28,6 +28,7 @@
     "lint:fix": "prettier --write . && eslint . --fix",
     "release": "zotero-plugin release",
     "test": "zotero-plugin test",
+    "test:helper": "uv run --no-project --with pymupdf python -B -m unittest discover -s skills/zotero-mineru/tests -v",
     "update-deps": "pnpm update"
   },
   "dependencies": {

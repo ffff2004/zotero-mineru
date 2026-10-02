@@ -9,6 +9,10 @@ yarn.lock
 # TSC
 tsconfig.tsbuildinfo
 
+# Python helpers
+__pycache__/
+*.py[cod]
+
 # Scaffold
 .env
 .scaffold

@@ -334,7 +334,7 @@ describe("MinerU selection and task interface", function () {
       );
       assert.include(
         await IOUtils.readUTF8(failed.logs!.stderr),
-        `config=${initial.configPath}`,
+        `config=${PathUtils.join(PathUtils.parent(failed.logs!.stdout)!, "config.yaml")}`,
       );
     } finally {
       Services.env.set("MINERU_CONFIG", oldConfig);
@@ -360,8 +360,10 @@ describe("MinerU selection and task interface", function () {
       const originalZip = Zotero.File.zipDirectory;
       const originalRemove = IOUtils.remove;
       const views: TaskView[] = [];
+      const controller = new MineruTaskController();
       try {
         (Zotero.File as any).zipDirectory = async () => {
+          if (retained) controller.cancel();
           throw new Error("Upload ZIP failed; api_key=publication-secret", {
             cause: new Error("Native ZIP write refused"),
           });
@@ -379,7 +381,7 @@ describe("MinerU selection and task interface", function () {
             return originalRemove(path, options);
           };
         }
-        const result = await new MineruTaskController().run(
+        const result = await controller.run(
           [source],
           async () => source,
           {
@@ -392,6 +394,7 @@ describe("MinerU selection and task interface", function () {
         assert.isUndefined(result);
         const failed = views.at(-1)!;
         assert.equal(failed.phase, "failed");
+        assert.equal(failed.state, "failed");
         assert.equal(
           failed.failureCategory,
           retained ? "recovery" : "persistence",
@@ -855,6 +858,131 @@ describe("MinerU selection and task interface", function () {
         before,
       );
     } finally {
+      await source.eraseTx();
+      dir.remove(true);
+    }
+  });
+
+  it("cancels an actual child and accepts the next task", async function () {
+    const dir = directory();
+    const source = await pdf(dir, "source.pdf");
+    const runtime = await runtimeFixture(
+      dir,
+      "runtime",
+      "#!/bin/sh\nexec sleep 10\n",
+    );
+    const controller = new MineruTaskController();
+    const settings: TaskSettings = {
+      descriptorPath: runtime.descriptorPath,
+      customConfigPath: runtime.configPath,
+      options: defaults(),
+    };
+    const views: TaskView[] = [];
+    let started!: () => void;
+    const parsing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    try {
+      const running = controller.run(
+        [source],
+        async () => source,
+        settings,
+        (view) => {
+          views.push(view);
+          if (view.phase === "parsing") started();
+        },
+      );
+      await parsing;
+      await Zotero.Promise.delay(50);
+      assert.isTrue(controller.cancel());
+      assert.isFalse(controller.cancel());
+      assert.isUndefined(await running);
+      assert.equal(views.at(-1)!.state, "cancelled");
+      assert.isTrue(views.some((view) => view.state === "cancel_requested"));
+      assert.isFalse(controller.busy);
+      const descriptor = JSON.parse(
+        await IOUtils.readUTF8(runtime.descriptorPath),
+      );
+      await IOUtils.writeUTF8(descriptor.mineru_kit, "#!/bin/sh\nexit 3\n");
+      await controller.run(
+        [source],
+        async () => source,
+        settings,
+        (view) => views.push(view),
+      );
+      assert.equal(views.at(-1)!.state, "failed");
+      assert.equal(views.at(-1)!.errorCode, "PARSE_FAILED");
+    } finally {
+      await source.eraseTx();
+      dir.remove(true);
+    }
+  });
+
+  it("reuses a published result after snapshot preparation and honors committed success after late cancellation", async function () {
+    const dir = directory();
+    const source = await pdf(dir, "source.pdf");
+    const zip = await parseZIP(dir);
+    const marker = PathUtils.join(dir.path, "executions");
+    const runtime = await runtimeFixture(
+      dir,
+      "runtime",
+      `#!/bin/sh\nprintf 'run\\n' >> '${marker}'\ncp '${zip}' "$4"\n`,
+    );
+    const settings: TaskSettings = {
+      descriptorPath: runtime.descriptorPath,
+      customConfigPath: runtime.configPath,
+      options: defaults(),
+    };
+    const controller = new MineruTaskController();
+    const views: TaskView[] = [];
+    let result: Zotero.Item | undefined;
+    try {
+      result = await controller.run(
+        [source],
+        async () => source,
+        settings,
+        (view) => {
+          views.push(view);
+          if (
+            view.record?.stage === "saving" &&
+            view.record.event === "complete"
+          )
+            controller.cancel();
+        },
+      );
+      assert.isDefined(result);
+      assert.equal(views.at(-1)!.state, "succeeded");
+      const snapshot = views.at(-1)!.snapshot!;
+      assert.equal(
+        snapshot.inputSha256,
+        await IOUtils.computeHexDigest(
+          (await source.getFilePathAsync())!,
+          "sha256",
+        ),
+      );
+      const reused = await controller.run(
+        [source],
+        async () => source,
+        settings,
+        (view) => views.push(view),
+        {
+          findReusable: async (prepared) => {
+            assert.equal(prepared.source.id, source.id);
+            assert.equal(prepared.inputSha256, snapshot.inputSha256);
+            assert.equal(
+              prepared.configurationSha256,
+              snapshot.configurationSha256,
+            );
+            return result;
+          },
+        },
+      );
+      assert.equal(reused?.id, result!.id);
+      assert.isTrue(views.at(-1)!.reused);
+      assert.equal(await IOUtils.readUTF8(marker), "run\n");
+      assert.isUndefined(views.at(-1)!.logs);
+    } finally {
+      if (result) await result.eraseTx();
       await source.eraseTx();
       dir.remove(true);
     }

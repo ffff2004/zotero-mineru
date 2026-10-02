@@ -21,6 +21,49 @@ export type RuntimeSnapshot = {
   childEnvironment: { MINERU_CONFIG: string };
 };
 
+/** Capture a complete child environment, fingerprinting config-relevant values only. */
+export async function freezeParseEnvironment(configPath: string): Promise<{
+  environment: Record<string, string>;
+  sha256: string;
+}> {
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs",
+  ) as { Subprocess: { getEnvironment(): Record<string, string> } };
+  const environment = { ...Subprocess.getEnvironment() };
+  const keys = new Set([
+    "HOME",
+    ...Object.keys(environment).filter(
+      (key) => key.startsWith("MINERU_") && key !== "MINERU_CONFIG",
+    ),
+  ]);
+  const visited = new Set<string>();
+  const discover = (value: string) => {
+    for (const match of value.matchAll(/\$\{(\w+)(?=[:}])/g)) {
+      const key = match[1];
+      keys.add(key);
+      if (!visited.has(key)) {
+        visited.add(key);
+        discover(environment[key] || "");
+      }
+    }
+  };
+  discover(await IOUtils.readUTF8(configPath));
+  const bytes = new TextEncoder().encode(
+    JSON.stringify(
+      [...keys].sort().map((key) => [key, environment[key] ?? null]),
+    ),
+  );
+  const hash = (Components.classes as any)[
+    "@mozilla.org/security/hash;1"
+  ].createInstance(Components.interfaces.nsICryptoHash) as nsICryptoHash;
+  hash.initWithString("sha256");
+  hash.update(bytes, bytes.length);
+  const sha256 = Array.from(hash.finish(false), (character) =>
+    character.charCodeAt(0).toString(16).padStart(2, "0"),
+  ).join("");
+  return { environment, sha256 };
+}
+
 /** Carries only the supported installation profile, never descriptor payloads. */
 export class RuntimeCompatibilityError extends Error {
   constructor(

@@ -1,7 +1,10 @@
 import { assert } from "chai";
 import { runMineruParse, MineruTaskError } from "../src/modules/mineru/parse";
 import { extractValidatedPackage } from "../src/modules/mineru/package";
-import { freezeRuntime } from "../src/modules/mineru/runtime";
+import {
+  freezeParseEnvironment,
+  freezeRuntime,
+} from "../src/modules/mineru/runtime";
 import manifest from "../runtime/release.json";
 
 function temp(): nsIFile {
@@ -131,7 +134,7 @@ cp '${zip}' "$4"
       );
       assert.include(
         await IOUtils.readUTF8(result.stderrLog),
-        `config=${frozen.configPath}`,
+        `config=${PathUtils.join(result.taskDirectory, "config.yaml")}`,
       );
       const provenance = JSON.parse(
         await IOUtils.readUTF8(
@@ -143,6 +146,7 @@ cp '${zip}' "$4"
         "plugin",
         "runtime",
         "source",
+        "configuration",
         "requested_options",
       ]);
       assert.deepEqual(Object.keys(provenance.source), ["sha256"]);
@@ -153,6 +157,15 @@ cp '${zip}' "$4"
       assert.equal(
         provenance.runtime.docvortex_version,
         manifest.packages.docvortex.version,
+      );
+      assert.equal(provenance.runtime.profile, "cpu");
+      assert.equal(
+        provenance.configuration.sha256,
+        await IOUtils.computeHexDigest(frozen.configPath, "sha256"),
+      );
+      assert.equal(
+        provenance.configuration.environment_sha256,
+        (await freezeParseEnvironment(frozen.configPath)).sha256,
       );
       assert.isFalse(
         await IOUtils.exists(
@@ -176,6 +189,88 @@ cp '${zip}' "$4"
       await IOUtils.remove(tail.taskDirectory, { recursive: true });
       await IOUtils.remove(result.taskDirectory, { recursive: true });
     } finally {
+      await IOUtils.remove(root.path, { recursive: true, ignoreAbsent: true });
+    }
+  });
+
+  it("freezes config bytes and PDF before the reuse decision", async function () {
+    const root = temp();
+    let taskRoot: string | undefined;
+    const originalVariable = Services.env.get("MINERU_MODEL_SOURCE");
+    const originalReferenced = Services.env.get("ZOTERO_MINERU_TEST_REFERENCE");
+    const originalUnrelated = Services.env.get("ZOTERO_MINERU_UNRELATED_TEST");
+    try {
+      const zip = await fixtureZIP(root, middle(), "# Result\n");
+      const pdf = PathUtils.join(root.path, "sample.pdf");
+      await IOUtils.writeUTF8(pdf, "%PDF-1.4\n%%EOF\n");
+      const originalPDFHash = await IOUtils.computeHexDigest(pdf, "sha256");
+      const frozen = await runtime(
+        root,
+        `#!/bin/sh\ncat "$MINERU_CONFIG"\ncat "$2"\nprintf '%s\\n' "$MINERU_MODEL_SOURCE" "$ZOTERO_MINERU_TEST_REFERENCE"\ncp '${zip}' "$4"\n`,
+      );
+      const configText =
+        'model:\n  source: "${ZOTERO_MINERU_TEST_REFERENCE}"\n';
+      await IOUtils.writeUTF8(frozen.configPath, configText);
+      Services.env.set("MINERU_MODEL_SOURCE", "frozen-model-source");
+      Services.env.set("ZOTERO_MINERU_TEST_REFERENCE", "frozen-reference");
+      const environmentHash = (await freezeParseEnvironment(frozen.configPath))
+        .sha256;
+      Services.env.set("ZOTERO_MINERU_UNRELATED_TEST", "unrelated-change");
+      assert.equal(
+        (await freezeParseEnvironment(frozen.configPath)).sha256,
+        environmentHash,
+      );
+      const originalConfigHash = await IOUtils.computeHexDigest(
+        frozen.configPath,
+        "sha256",
+      );
+      const result = await runMineruParse({
+        pdfPath: pdf,
+        runtime: frozen,
+        options: {
+          tier: "standard",
+          ocr_mode: "auto",
+          image_analysis: true,
+          page_range: "all",
+        },
+        onPreparedSnapshot: async (snapshot) => {
+          assert.equal(snapshot.configurationSha256, originalConfigHash);
+          assert.equal(snapshot.inputSha256, originalPDFHash);
+          assert.equal(snapshot.environmentSha256, environmentHash);
+          Services.env.set("MINERU_MODEL_SOURCE", "changed-model-source");
+          Services.env.set("ZOTERO_MINERU_TEST_REFERENCE", "changed-reference");
+          assert.notEqual(
+            (await freezeParseEnvironment(frozen.configPath)).sha256,
+            environmentHash,
+          );
+          await IOUtils.writeUTF8(frozen.configPath, "changed configuration\n");
+          await IOUtils.writeUTF8(pdf, "changed PDF\n");
+          return false;
+        },
+      });
+      assert.isFalse("skipped" in result);
+      if ("skipped" in result) throw new Error("Unexpected skip");
+      taskRoot = result.taskDirectory;
+      assert.equal(
+        await IOUtils.readUTF8(result.stdoutLog),
+        `${configText}%PDF-1.4\n%%EOF\nfrozen-model-source\nfrozen-reference\n`,
+      );
+      const provenance = JSON.parse(
+        await IOUtils.readUTF8(
+          PathUtils.join(result.packageDirectory, "provenance.json"),
+        ),
+      );
+      assert.equal(provenance.configuration.sha256, originalConfigHash);
+      assert.equal(provenance.source.sha256, originalPDFHash);
+      assert.equal(
+        provenance.configuration.environment_sha256,
+        environmentHash,
+      );
+    } finally {
+      Services.env.set("MINERU_MODEL_SOURCE", originalVariable);
+      Services.env.set("ZOTERO_MINERU_TEST_REFERENCE", originalReferenced);
+      Services.env.set("ZOTERO_MINERU_UNRELATED_TEST", originalUnrelated);
+      if (taskRoot) await IOUtils.remove(taskRoot, { recursive: true });
       await IOUtils.remove(root.path, { recursive: true, ignoreAbsent: true });
     }
   });
@@ -283,7 +378,7 @@ exit 3
         clearTimeout(timer);
       }
       assert.instanceOf(failure, MineruTaskError);
-      assert.equal((failure as MineruTaskError).category, "process");
+      assert.equal((failure as MineruTaskError).category, "cancelled");
     } finally {
       await IOUtils.remove(root.path, { recursive: true, ignoreAbsent: true });
     }

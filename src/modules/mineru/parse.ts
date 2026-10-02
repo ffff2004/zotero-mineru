@@ -1,6 +1,6 @@
 /** Run one locked MinerU CLI task and return a validated, unpublished package. */
 import { extractValidatedPackage, type ParseOptions } from "./package";
-import type { RuntimeSnapshot } from "./runtime";
+import { freezeParseEnvironment, type RuntimeSnapshot } from "./runtime";
 
 type Pipe = { read(): Promise<ArrayBuffer> };
 type Child = {
@@ -34,6 +34,21 @@ export type ParseRequest = {
   onLogs?: (logs: { stdout: string; stderr: string }) => void;
 };
 
+export type PreparedParse = {
+  inputSha256: string;
+  requestedOptions: ParseOptions;
+  runtime: RuntimeSnapshot;
+  configurationSha256: string;
+  environmentSha256: string;
+};
+
+export type SnapshotParseRequest = ParseRequest & {
+  /** Return true to reuse an existing result before starting any subprocess. */
+  onPreparedSnapshot: (snapshot: PreparedParse) => Promise<boolean>;
+};
+
+export type SkippedParse = { skipped: true };
+
 export type ValidatedParse = {
   packageDirectory: string;
   taskDirectory: string;
@@ -49,7 +64,8 @@ export class MineruTaskError extends Error {
       | "input"
       | "environment"
       | "process"
-      | "validation",
+      | "validation"
+      | "cancelled",
     message: string,
     public readonly logs?: { stdout: string; stderr: string },
     cause?: unknown,
@@ -118,9 +134,13 @@ function taskError(
 }
 
 /** The caller owns publication and may retain the task directory for log actions. */
+export function runMineruParse(
+  request: SnapshotParseRequest,
+): Promise<ValidatedParse | SkippedParse>;
+export function runMineruParse(request: ParseRequest): Promise<ValidatedParse>;
 export async function runMineruParse(
-  request: ParseRequest,
-): Promise<ValidatedParse> {
+  request: ParseRequest | SnapshotParseRequest,
+): Promise<ValidatedParse | SkippedParse> {
   const options: ParseOptions = {
     tier: request.options.tier,
     ocr_mode: request.options.ocr_mode,
@@ -142,6 +162,7 @@ export async function runMineruParse(
   const packageDirectory = PathUtils.join(root, "package");
   const stdout = PathUtils.join(root, "stdout.log");
   const stderr = PathUtils.join(root, "stderr.log");
+  const config = PathUtils.join(root, "config.yaml");
   try {
     await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
     await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
@@ -163,6 +184,20 @@ export async function runMineruParse(
         stderr,
       );
     }
+    // The child reads these exact bytes, even if preferences or the original
+    // configuration change while result lookup or parsing is in progress.
+    await IOUtils.copy(request.runtime.configPath, config, {
+      noOverwrite: true,
+    });
+    const configurationSha256 = await IOUtils.computeHexDigest(
+      config,
+      "sha256",
+    );
+    const runtime: RuntimeSnapshot = {
+      ...request.runtime,
+      childEnvironment: { MINERU_CONFIG: config },
+    };
+    const frozenEnvironment = await freezeParseEnvironment(config);
     if (await IOUtils.exists(zip)) {
       throw taskError(
         "validation",
@@ -172,9 +207,25 @@ export async function runMineruParse(
       );
     }
     if (request.signal?.aborted) {
-      throw taskError("process", "MinerU task stopped", stdout, stderr);
+      throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
     }
     request.onPrepared?.();
+    if (
+      "onPreparedSnapshot" in request &&
+      (await request.onPreparedSnapshot({
+        inputSha256: sha256,
+        requestedOptions: options,
+        runtime,
+        configurationSha256,
+        environmentSha256: frozenEnvironment.sha256,
+      }))
+    ) {
+      await IOUtils.remove(root, { recursive: true });
+      return { skipped: true };
+    }
+    if (request.signal?.aborted) {
+      throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
+    }
     request.onParseStart?.();
     let child: Child;
     try {
@@ -185,9 +236,10 @@ export async function runMineruParse(
         command: request.runtime.descriptor.mineru_kit,
         arguments: childArguments(pdf, zip, options),
         environment: {
-          MINERU_CONFIG: request.runtime.childEnvironment.MINERU_CONFIG,
+          ...frozenEnvironment.environment,
+          MINERU_CONFIG: runtime.childEnvironment.MINERU_CONFIG,
         },
-        environmentAppend: true,
+        environmentAppend: false,
         stderr: "pipe",
       });
     } catch (error) {
@@ -257,6 +309,9 @@ export async function runMineruParse(
           outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
         );
       }
+      if (stopped && outcome.status === "fulfilled" && !cleanupErrors.length) {
+        throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
+      }
       if (
         outcome.status === "rejected" ||
         stopped ||
@@ -294,9 +349,11 @@ export async function runMineruParse(
       await extractValidatedPackage(
         zip,
         packageDirectory,
-        request.runtime,
+        runtime,
         sha256,
         options,
+        configurationSha256,
+        frozenEnvironment.sha256,
       );
     } catch (error) {
       if (error instanceof MineruTaskError) throw error;
@@ -309,7 +366,7 @@ export async function runMineruParse(
       );
     }
     if (request.signal?.aborted) {
-      throw taskError("process", "MinerU task stopped", stdout, stderr);
+      throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
     }
     return {
       packageDirectory,

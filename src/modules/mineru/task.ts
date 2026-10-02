@@ -1,5 +1,5 @@
 import { freezeRuntime } from "./runtime";
-import { runMineruParse, MineruTaskError } from "./parse";
+import { runMineruParse, MineruTaskError, type PreparedParse } from "./parse";
 import {
   PublicationRecoveryError,
   publishValidatedPackage,
@@ -17,9 +17,24 @@ export type TaskPhase =
   | "validation"
   | "saving"
   | "done"
+  | "cancelled"
   | "failed";
+export type TaskState =
+  | "running"
+  | "cancel_requested"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+export type TaskSnapshot = PreparedParse & { source: Zotero.Item };
+export type TaskLifecycle = {
+  findReusable?: (snapshot: TaskSnapshot) => Promise<Zotero.Item | undefined>;
+};
 export type TaskView = {
   phase: TaskPhase;
+  state?: TaskState;
+  errorCode?: string;
+  snapshot?: TaskSnapshot;
+  reused?: boolean;
   message?: string;
   /** One append-only event; records belong only to the receiving window. */
   record?: PluginLogRecord;
@@ -92,6 +107,7 @@ export class MineruTaskController {
   private active = false;
   private alive = true;
   private abort?: AbortController;
+  private reportCancellation?: () => void;
 
   get busy(): boolean {
     return this.active;
@@ -102,11 +118,20 @@ export class MineruTaskController {
     this.abort?.abort();
   }
 
+  /** Cancellation leaves this controller available for the next task. */
+  cancel(): boolean {
+    if (!this.abort || this.abort.signal.aborted) return false;
+    this.abort.abort();
+    this.reportCancellation?.();
+    return true;
+  }
+
   async run(
     items: Zotero.Item[],
     choose: ChoosePDF,
     settings: TaskSettings,
     report: (view: TaskView) => void,
+    lifecycle: TaskLifecycle = {},
   ): Promise<Zotero.Item | undefined> {
     if (!this.alive) throw new Error("MinerU plugin has stopped");
     if (this.active)
@@ -116,11 +141,22 @@ export class MineruTaskController {
     this.abort = abort;
     let stage: Exclude<PluginLogStage, "recovery" | "task"> = "preparing";
     let phase: TaskPhase = "preparing";
+    let state: TaskState = "running";
+    let snapshot: TaskSnapshot | undefined;
     let logs: TaskView["logs"];
     let configPath: string | undefined;
     let publicationErrorReported = false;
     const emit = (record?: PluginLogRecord, extra?: Partial<TaskView>) => {
-      if (this.alive) report({ phase, logs, configPath, record, ...extra });
+      if (this.alive)
+        report({ phase, state, snapshot, logs, configPath, record, ...extra });
+    };
+    this.reportCancellation = () => {
+      state = "cancel_requested";
+      emit();
+    };
+    const checkCancelled = () => {
+      if (abort.signal.aborted)
+        throw new MineruTaskError("cancelled", "MinerU task stopped");
     };
     const log = (
       logStage: PluginLogStage,
@@ -159,9 +195,9 @@ export class MineruTaskController {
         );
       }
       configPath = runtime.configPath;
-      if (abort.signal.aborted) return;
+      checkCancelled();
       const source = await resolveSelectedPDF(items, choose);
-      if (abort.signal.aborted) return;
+      checkCancelled();
       let path = await source.getFilePathAsync();
       if (!path && source.isStoredFileAttachment()) {
         try {
@@ -174,7 +210,7 @@ export class MineruTaskController {
             error,
           );
         }
-        if (abort.signal.aborted) return;
+        checkCancelled();
         path = await source.getFilePathAsync();
       }
       if (!path) {
@@ -185,12 +221,18 @@ export class MineruTaskController {
             : "Linked PDF file is missing; restore or relink the PDF",
         );
       }
-      if (abort.signal.aborted) return;
+      checkCancelled();
+      let reused: Zotero.Item | undefined;
       const parsed = await runMineruParse({
         pdfPath: path,
         runtime,
         options: frozenSettings.options,
         signal: abort.signal,
+        onPreparedSnapshot: async (prepared) => {
+          snapshot = { ...prepared, source };
+          reused = await lifecycle.findReusable?.(snapshot);
+          return !!reused;
+        },
         onPrepared: () =>
           log(
             "preparing",
@@ -217,8 +259,24 @@ export class MineruTaskController {
           emit();
         },
       });
+      if ("skipped" in parsed) {
+        checkCancelled();
+        phase = "done";
+        state = "succeeded";
+        logs = undefined;
+        emit(
+          {
+            timestamp: new Date().toISOString(),
+            stage: "task",
+            event: "success",
+            message: "Reused a complete attachment for this PDF snapshot",
+          },
+          { result: reused, reused: true },
+        );
+        return reused;
+      }
       logs = { stdout: parsed.stdoutLog, stderr: parsed.stderrLog };
-      if (abort.signal.aborted) return;
+      checkCancelled();
       log("validation", "complete", "Result package validated");
       stage = "saving";
       phase = "saving";
@@ -255,9 +313,11 @@ export class MineruTaskController {
           );
         },
       });
-      if (abort.signal.aborted) return;
+      // Publication has committed and completed recovery/finalization. A late
+      // cancellation cannot turn an already saved attachment into cancellation.
       log("saving", "complete", "Complete attachment publication confirmed");
       phase = "done";
+      state = "succeeded";
       emit(
         {
           timestamp: new Date().toISOString(),
@@ -265,12 +325,30 @@ export class MineruTaskController {
           event: "success",
           message: "Task completed",
         },
-        { result },
+        { result, reused: false },
       );
       return result;
     } catch (error) {
       if (error instanceof MineruTaskError && error.logs) logs = error.logs;
-      if (!abort.signal.aborted) {
+      const cancelled =
+        (error instanceof MineruTaskError && error.category === "cancelled") ||
+        (abort.signal.aborted &&
+          error instanceof Error &&
+          error.message === "MinerU task stopped" &&
+          !(error instanceof PublicationRecoveryError));
+      if (cancelled) {
+        phase = "cancelled";
+        state = "cancelled";
+        emit(
+          {
+            timestamp: new Date().toISOString(),
+            stage: "task",
+            event: "complete",
+            message: "Task cancelled; no new result was published",
+          },
+          { message: "MinerU task cancelled", errorCode: "CANCELLED" },
+        );
+      } else {
         const category =
           error instanceof PublicationRecoveryError
             ? "recovery"
@@ -309,6 +387,7 @@ export class MineruTaskController {
             );
         }
         phase = "failed";
+        state = "failed";
         emit(
           {
             timestamp: new Date().toISOString(),
@@ -316,13 +395,31 @@ export class MineruTaskController {
             event: "failure",
             message: "Task failed",
           },
-          { message, failureCategory: category },
+          {
+            message,
+            failureCategory: category,
+            errorCode:
+              category === "recovery"
+                ? "RECOVERY_FAILED"
+                : category === "persistence"
+                  ? "PUBLICATION_FAILED"
+                  : category === "input"
+                    ? "INPUT_INVALID"
+                    : category === "environment"
+                      ? "RUNTIME_UNAVAILABLE"
+                      : category === "process"
+                        ? "PARSE_FAILED"
+                        : category === "validation"
+                          ? "VALIDATION_FAILED"
+                          : "TASK_FAILED",
+          },
         );
       }
       return undefined;
     } finally {
       this.active = false;
       this.abort = undefined;
+      this.reportCancellation = undefined;
     }
   }
 }

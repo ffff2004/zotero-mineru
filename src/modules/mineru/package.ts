@@ -2,7 +2,7 @@
 import Ajv2020 from "ajv/dist/2020.js";
 import middleSchema from "./middle-json.schema.json";
 import pkg from "../../../package.json";
-import type { RuntimeSnapshot } from "./runtime";
+import { freezeParseEnvironment, type RuntimeSnapshot } from "./runtime";
 
 export type ParseOptions = {
   tier: "flash" | "basic" | "standard" | "advanced";
@@ -328,16 +328,23 @@ function provenance(
   runtime: RuntimeSnapshot,
   sha256: string,
   options: ParseOptions,
+  configurationSha256: string,
+  environmentSha256: string,
 ) {
   const result = {
     package_format_version: 1,
     plugin: { id: pkg.config.addonID, version: pkg.version },
     runtime: {
       release_id: runtime.descriptor.release_id,
+      profile: runtime.descriptor.profile,
       mineru_version: runtime.descriptor.packages.mineru.version,
       docvortex_version: runtime.descriptor.packages.docvortex.version,
     },
     source: { sha256 },
+    configuration: {
+      sha256: configurationSha256,
+      environment_sha256: environmentSha256,
+    },
     requested_options: {
       tier: options.tier,
       ocr_mode: options.ocr_mode,
@@ -346,6 +353,10 @@ function provenance(
     },
   };
   if (!/^[a-f0-9]{64}$/.test(sha256)) throw new Error("Invalid input SHA-256");
+  if (!/^[a-f0-9]{64}$/.test(configurationSha256))
+    throw new Error("Invalid configuration SHA-256");
+  if (!/^[a-f0-9]{64}$/.test(environmentSha256))
+    throw new Error("Invalid environment SHA-256");
   return result;
 }
 
@@ -356,6 +367,8 @@ export async function extractValidatedPackage(
   runtime: RuntimeSnapshot,
   sha256: string,
   options: ParseOptions,
+  configurationSha256?: string,
+  environmentSha256?: string,
 ): Promise<string> {
   if (await IOUtils.exists(directory))
     throw new Error("Package directory already exists");
@@ -395,6 +408,29 @@ export async function extractValidatedPackage(
   if (JSON.stringify(files) !== JSON.stringify(expected)) {
     throw new Error("Extracted tree differs from ZIP");
   }
+  await validatePublishedPackage(directory);
+  const result = provenance(
+    runtime,
+    sha256,
+    options,
+    configurationSha256 ??
+      (await IOUtils.computeHexDigest(runtime.configPath, "sha256")),
+    environmentSha256 ??
+      (await freezeParseEnvironment(runtime.configPath)).sha256,
+  );
+  const path = PathUtils.join(directory, "provenance.json");
+  await IOUtils.writeUTF8(path, JSON.stringify(result, null, 2) + "\n");
+  const stored = JSON.parse(await IOUtils.readUTF8(path)) as unknown;
+  if (JSON.stringify(stored) !== JSON.stringify(result))
+    throw new Error("Invalid provenance");
+  return directory;
+}
+
+/** Recheck an on-disk bundle using the same content checks as fresh exports. */
+export async function validatePublishedPackage(
+  directory: string,
+): Promise<void> {
+  const files = await actualFiles(directory);
   for (const name of REQUIRED) {
     if (!files.includes(name))
       throw new Error(`Missing required file: ${name}`);
@@ -424,11 +460,4 @@ export async function extractValidatedPackage(
       verifyReferences(value, fileSet);
     }
   }
-  const result = provenance(runtime, sha256, options);
-  const path = PathUtils.join(directory, "provenance.json");
-  await IOUtils.writeUTF8(path, JSON.stringify(result, null, 2) + "\n");
-  const stored = JSON.parse(await IOUtils.readUTF8(path)) as unknown;
-  if (JSON.stringify(stored) !== JSON.stringify(result))
-    throw new Error("Invalid provenance");
-  return directory;
 }
