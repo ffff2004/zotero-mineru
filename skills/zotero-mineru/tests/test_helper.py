@@ -88,7 +88,7 @@ class LibraryServer:
                         ]
                     )
                 else:
-                    self.send({"protocolVersion": 1, "userLibraryID": 9})
+                    self.send({"protocolVersion": 2, "userLibraryID": 9})
 
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -106,7 +106,7 @@ class LibraryServer:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.client = helper.Client(
-            f"http://127.0.0.1:{self.server.server_port}/example/v1"
+            f"http://127.0.0.1:{self.server.server_port}/example/v2"
         )
 
     def close(self):

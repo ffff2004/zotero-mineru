@@ -15,16 +15,20 @@ repository's `package.json`; for a detached skill copy set
 For a detached copy with the default Zotero port and plugin prefix:
 
 ```bash
-export ZOTERO_MINERU_API_BASE=http://127.0.0.1:23119/mineru/v1
+export ZOTERO_MINERU_API_BASE=http://127.0.0.1:23119/mineru/v2
 ```
 
 Change the port or prefix if the installed plugin uses a custom configuration.
+The helper requires v2; an explicit v1 base reports `upgrade_required`.
 
 ## Read a paper
 
 1. Run `status`. Zotero must be open with the plugin loaded. Existing results
-   can be read without a working runtime. Generation requires `recoveryReady`
-   and `runtime.ready`; inspect the reported error when either is false.
+   can be read without a working runtime. Admission requires `recoveryReady`
+   and `storageReady`; runtime readiness is checked at execution. The shared
+   queue starts paused, including after restart. For generation, batch submission,
+   waiting, cancellation or queue ordering, follow
+   [generation.md](references/generation.md); submission alone never resumes it.
 2. Resolve the paper with `search "title or author"` or use a supplied Zotero
    library ID and item key. Report title, creators, date and item key when
    presenting search candidates. Ask the user to choose when identity is

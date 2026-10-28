@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import html
+import http.client
 import json
 import math
 import os
@@ -12,6 +13,7 @@ import sys
 import time
 import unicodedata
 import uuid
+from collections import Counter
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -37,7 +39,7 @@ def api_base(explicit=None):
             if candidate.is_file():
                 config = read_json(candidate).get("config", {})
                 if config.get("addonRef"):
-                    value = f"http://127.0.0.1:23119/{config['addonRef']}/v1"
+                    value = f"http://127.0.0.1:23119/{config['addonRef']}/v2"
                     break
     if not value:
         raise Failure(
@@ -52,15 +54,106 @@ def api_base(explicit=None):
         or url.password
     ):
         raise Failure("invalid_api_base", "The task API must be an HTTP loopback URL")
+    if url.path.rstrip("/").endswith("/v1"):
+        raise Failure("upgrade_required", "Use the installed plugin's v2 API base")
+    if url.query or url.fragment:
+        raise Failure(
+            "invalid_api_base", "The API base cannot contain query or fragment"
+        )
     return value.rstrip("/")
+
+
+NONTERMINAL = {"queued", "running", "cancel_requested"}
+TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
+
+
+def task_outcome(task):
+    if (
+        not isinstance(task, dict)
+        or not isinstance(task.get("taskID"), str)
+        or not task["taskID"]
+        or not isinstance(task.get("state"), str)
+        or task["state"] not in NONTERMINAL | TERMINAL
+    ):
+        raise Failure(
+            "invalid_response", "Expected a known task ID and state", record=task
+        )
+    terminal = task["state"] in TERMINAL
+    return {
+        **task,
+        "terminal": terminal,
+        "outcome": task["state"] if terminal else "nonterminal",
+        "waitingTimedOut": False,
+    }
+
+
+def batch_outcome(batch):
+    if (
+        not isinstance(batch, dict)
+        or not isinstance(batch.get("batchID"), str)
+        or not batch["batchID"]
+    ):
+        raise Failure("invalid_response", "Expected a batch record", record=batch)
+    for key in ("taskIDs", "tasks", "invalid", "expiredTaskIDs"):
+        if not isinstance(batch.get(key), list):
+            raise Failure("invalid_response", f"Batch lacks {key}", record=batch)
+    if not isinstance(batch.get("partialHistory"), bool):
+        raise Failure("invalid_response", "Batch lacks partialHistory", record=batch)
+    tasks = [task_outcome(task) for task in batch["tasks"]]
+    ids = batch["taskIDs"]
+    expired = batch["expiredTaskIDs"]
+    retained = [task["taskID"] for task in tasks]
+    if (
+        not all(isinstance(item, str) and item for item in ids + expired)
+        or Counter(ids) != Counter(retained + expired)
+        or (not ids and not batch["invalid"])
+    ):
+        raise Failure("invalid_response", "Inconsistent batch membership", record=batch)
+    pending = any(not task["terminal"] for task in tasks)
+    incomplete = batch["partialHistory"] or bool(expired)
+    failed = bool(batch["invalid"]) or any(
+        task["state"] in TERMINAL - {"succeeded"} for task in tasks
+    )
+    if incomplete:
+        outcome = "incomplete_history"
+    elif pending:
+        outcome = "nonterminal"
+    else:
+        outcome = "failed" if failed else "succeeded"
+    return {
+        **batch,
+        "tasks": tasks,
+        "terminal": not pending and not incomplete,
+        "outcome": outcome,
+        "hasUnsuccessfulMembers": failed,
+        "waitingTimedOut": False,
+    }
+
+
+def operation_exit(result):
+    if (
+        result.get("error")
+        or result.get("hasUnsuccessfulMembers")
+        or result.get("outcome")
+        in {"failed", "cancelled", "interrupted", "incomplete_history"}
+    ):
+        return 1
+    return 2 if result.get("waitingTimedOut") else 0
+
+
+class LoopbackRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        raise Failure("invalid_response", "The local API must not redirect requests")
 
 
 class Client:
     def __init__(self, base, timeout=15):
-        self.base = base
+        self.base = api_base(base)
         self.timeout = timeout
         # Local Zotero traffic must not follow proxy environment settings.
-        self.opener = request.build_opener(request.ProxyHandler({}))
+        self.opener = request.build_opener(
+            request.ProxyHandler({}), LoopbackRedirectHandler()
+        )
 
     def call(self, endpoint, data=None, query=None, local_api=False):
         base = self.base
@@ -80,20 +173,27 @@ class Client:
                 request.Request(url, data=payload, headers=headers),
                 timeout=self.timeout,
             ) as response:
-                return json.load(response)
+                value = json.load(response)
+                if not local_api and not isinstance(value, dict):
+                    raise Failure(
+                        "invalid_response", "Expected a plugin JSON object", url=url
+                    )
+                return value
         except error.HTTPError as exc:
             try:
                 with exc:
                     body = json.load(exc)
-            except (ValueError, UnicodeError):
+            except (OSError, http.client.HTTPException, ValueError, UnicodeError):
                 body = {}
-            item = body.get("error", {})
+            item = body.get("error", {}) if isinstance(body, dict) else {}
+            if not isinstance(item, dict):
+                item = {}
             raise Failure(
                 item.get("code", "http_error"),
                 item.get("message", f"HTTP {exc.code}"),
                 **{k: v for k, v in item.items() if k not in {"code", "message"}},
             ) from exc
-        except (error.URLError, TimeoutError) as exc:
+        except (OSError, error.URLError, http.client.HTTPException) as exc:
             raise Failure(
                 "connection_failed",
                 "Cannot reach Zotero; no task was resubmitted",
@@ -107,18 +207,53 @@ class Client:
     def find(self, library, key):
         return self.call("/results", query={"libraryID": library, "itemKey": key})
 
-    def wait(self, task, timeout, interval):
+    def wait(self, record, timeout, interval, batch=False):
+        summarize = batch_outcome if batch else task_outcome
+        endpoint, id_key = ("/batches", "batchID") if batch else ("/tasks", "taskID")
         deadline = time.monotonic() + timeout
-        while task.get("state") in {"running", "cancel_requested"}:
-            if time.monotonic() >= deadline:
-                return {**task, "waitingTimedOut": True}
-            time.sleep(min(interval, max(0, deadline - time.monotonic())))
-            try:
-                task = self.call("/tasks", query={"taskID": task["taskID"]})
-            except Failure as exc:
-                exc.value["error"]["taskID"] = task["taskID"]
-                raise
-        return task
+        try:
+            record = summarize(record)
+            while (
+                any(task["state"] in NONTERMINAL for task in record["tasks"])
+                if batch
+                else record["state"] in NONTERMINAL
+            ):
+                if time.monotonic() >= deadline:
+                    return {**record, "waitingTimedOut": True}
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                updated = self.call(endpoint, query={id_key: record[id_key]})
+                if (
+                    not isinstance(updated, dict)
+                    or updated.get(id_key) != record[id_key]
+                ):
+                    raise Failure(
+                        "invalid_response", "Polled identity changed", record=updated
+                    )
+                record = summarize(updated)
+            return record
+        except Failure as exc:
+            exc.value["lastRecord"] = record
+            if isinstance(record, dict) and id_key in record:
+                exc.value["error"][id_key] = record[id_key]
+            raise
+
+    def submit(self, payload, timeout, interval, batch=False, detach=False):
+        record = None
+        id_key = "batchID" if batch else "taskID"
+        try:
+            record = self.call("/batches" if batch else "/tasks", data=payload)
+            if detach:
+                result = batch_outcome(record) if batch else task_outcome(record)
+            else:
+                result = self.wait(record, timeout, interval, batch=batch)
+            return {**result, "requestID": payload["requestID"], "submission": payload}
+        except Failure as exc:
+            exc.value["error"]["requestID"] = payload["requestID"]
+            exc.value["submission"] = payload
+            if isinstance(record, dict) and record.get(id_key):
+                exc.value["error"][id_key] = record[id_key]
+                exc.value.setdefault("lastRecord", record)
+            raise
 
 
 def search(client, query):
@@ -153,27 +288,61 @@ def search(client, query):
         offset += len(batch)
 
 
-def ensure(client, library, key, options, force, request_id, timeout, interval):
-    found = client.find(library, key)
-    source = found.get("source", {})
-    if not source.get("itemKey") or source.get("libraryID") is None:
-        raise Failure(
-            "invalid_response", "Results response did not identify the source PDF"
-        )
-    # Plugin owns options, source snapshots, runtime identity and result reuse.
-    payload = {
-        "requestID": request_id,
-        "source": {k: source[k] for k in ("libraryID", "itemKey")},
-        "options": options,
-        "force": force,
-    }
+def ensure(
+    client, library, key, options, force, request_id, timeout, interval, detach=False
+):
     try:
-        task = client.call("/tasks", data=payload)
+        found = client.find(library, key)
+        source = found.get("source", {}) if isinstance(found, dict) else {}
+        if not source.get("itemKey") or source.get("libraryID") is None:
+            raise Failure(
+                "invalid_response", "Results response did not identify the source PDF"
+            )
+        # Plugin owns defaults, source snapshots, runtime identity and result reuse.
+        payload = {
+            "requestID": request_id,
+            "source": {k: source[k] for k in ("libraryID", "itemKey")},
+            "force": force,
+        }
+        if options is not None:
+            payload["options"] = options
+        return client.submit(payload, timeout, interval, detach=detach)
     except Failure as exc:
         exc.value["error"]["requestID"] = request_id
         raise
-    task = client.wait(task, timeout, interval)
-    return {**task, "requestID": request_id}
+
+
+def batch_submission(manifest, request_id=None):
+    """Fill stable wire identities, without storing a second queue or defaults."""
+    if not isinstance(manifest, dict):
+        raise Failure("invalid_manifest", "Batch manifest must be a JSON object")
+    # Saved helper outputs (including lost acknowledgements) are reusable inputs.
+    manifest = manifest.get("submission", manifest)
+    if not isinstance(manifest, dict) or set(manifest) - {"requestID", "items"}:
+        raise Failure("invalid_manifest", "Expected requestID and items only")
+    items = manifest.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= 1000:
+        raise Failure("invalid_manifest", "Batch items must contain 1–1000 requests")
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    if request_id is None:
+        request_id = (
+            manifest.get("requestID")
+            if "requestID" in manifest
+            else str(uuid.uuid5(uuid.NAMESPACE_URL, "zotero-mineru-batch:" + canonical))
+        )
+    if not isinstance(request_id, str) or not request_id:
+        raise Failure("invalid_manifest", "requestID must be a nonempty string")
+    prepared = []
+    for index, item in enumerate(items):
+        # Leave per-item source/options diagnostics to the plugin, including ambiguity.
+        if isinstance(item, dict):
+            item = dict(item)
+            if "requestID" not in item:
+                item["requestID"] = str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"{request_id}:item:{index}")
+                )
+        prepared.append(item)
+    return {"requestID": request_id, "items": prepared}
 
 
 def bundle_files(path):
@@ -511,6 +680,22 @@ def render(bundle, pdf, candidate, out, dpi=144, padding=0.01):
     return result
 
 
+def add_wait_options(parser, detach=False):
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60,
+        help="Seconds to wait; 0 returns immediately without cancelling",
+    )
+    parser.add_argument("--interval", type=float, default=2)
+    if detach:
+        parser.add_argument(
+            "--detach",
+            action="store_true",
+            help="Return after admission; never resume the queue implicitly",
+        )
+
+
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument(
@@ -531,21 +716,43 @@ def parser():
         if name == "ensure":
             p.add_argument(
                 "--options",
-                default="{}",
+                default=None,
                 help="JSON object; omitted options inherit plugin preferences",
             )
             p.add_argument("--force", action="store_true")
             p.add_argument(
                 "--request-id", help="Retain this ID when resuming the same submission"
             )
-            p.add_argument("--timeout", type=float, default=60)
-            p.add_argument("--interval", type=float, default=2)
-    for name in ("wait", "cancel"):
+            add_wait_options(p, detach=True)
+    p = commands.add_parser(
+        "submit-batch", help="Submit a reusable JSON batch manifest"
+    )
+    p.add_argument(
+        "--manifest",
+        required=True,
+        help="JSON file; saved submission output also accepted",
+    )
+    p.add_argument(
+        "--request-id", help="Override batch request ID for an explicitly new operation"
+    )
+    add_wait_options(p, detach=True)
+    for name in ("task", "batch", "wait", "cancel"):
         p = commands.add_parser(name)
-        p.add_argument("--task-id", required=True)
+        if name in {"task", "batch"}:
+            p.add_argument(f"--{name}-id", required=True)
+        else:
+            group = p.add_mutually_exclusive_group(required=True)
+            group.add_argument("--task-id")
+            group.add_argument("--batch-id")
         if name == "wait":
-            p.add_argument("--timeout", type=float, default=60)
-            p.add_argument("--interval", type=float, default=2)
+            add_wait_options(p)
+    for name in ("queue", "pause", "resume"):
+        commands.add_parser(name)
+    p = commands.add_parser("move")
+    p.add_argument("--task-id", required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--before")
+    group.add_argument("--after")
     p = commands.add_parser("locate")
     p.add_argument(
         "--bundle",
@@ -572,6 +779,17 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    identities = {
+        key: getattr(args, attr)
+        for key, attr in (
+            ("taskID", "task_id"),
+            ("batchID", "batch_id"),
+            ("requestID", "request_id"),
+        )
+        if getattr(args, attr, None)
+    }
+    if args.command == "ensure":
+        identities["requestID"] = args.request_id or str(uuid.uuid4())
     try:
         if hasattr(args, "timeout") and (
             args.timeout < 0
@@ -617,8 +835,8 @@ def main(argv=None):
             elif args.command == "find":
                 result = client.find(args.library_id, args.item_key)
             elif args.command == "ensure":
-                options = json.loads(args.options)
-                if not isinstance(options, dict):
+                options = json.loads(args.options) if args.options is not None else None
+                if args.options is not None and not isinstance(options, dict):
                     raise Failure("invalid_options", "--options must be a JSON object")
                 result = ensure(
                     client,
@@ -626,33 +844,71 @@ def main(argv=None):
                     args.item_key,
                     options,
                     args.force,
-                    args.request_id or str(uuid.uuid4()),
+                    identities["requestID"],
                     args.timeout,
                     args.interval,
+                    args.detach,
                 )
-            elif args.command == "wait":
-                task = client.call("/tasks", query={"taskID": args.task_id})
-                result = client.wait(task, args.timeout, args.interval)
-            else:
-                result = client.call("/tasks/cancel", data={"taskID": args.task_id})
-        if args.out:
+            elif args.command == "submit-batch":
+                payload = batch_submission(read_json(args.manifest), args.request_id)
+                identities["requestID"] = payload["requestID"]
+                result = client.submit(
+                    payload, args.timeout, args.interval, batch=True, detach=args.detach
+                )
+            elif args.command in {"task", "batch", "wait", "cancel"}:
+                batch = bool(getattr(args, "batch_id", None))
+                endpoint, id_key = (
+                    ("/batches", "batchID") if batch else ("/tasks", "taskID")
+                )
+                query = {id_key: identities[id_key]}
+                record = (
+                    client.call(endpoint + "/cancel", data=query)
+                    if args.command == "cancel"
+                    else client.call(endpoint, query=query)
+                )
+                if (
+                    not isinstance(record, dict)
+                    or record.get(id_key) != identities[id_key]
+                ):
+                    raise Failure(
+                        "invalid_response", "Response identity changed", record=record
+                    )
+                result = (
+                    client.wait(record, args.timeout, args.interval, batch=batch)
+                    if args.command == "wait"
+                    else (batch_outcome(record) if batch else task_outcome(record))
+                )
+            elif args.command in {"queue", "pause", "resume"}:
+                result = (
+                    client.call("/queue")
+                    if args.command == "queue"
+                    else client.call("/queue/" + args.command, data={})
+                )
+            elif args.command == "move":
+                position = (
+                    {"before": args.before} if args.before else {"after": args.after}
+                )
+                result = client.call(
+                    "/queue/move", data={"taskID": args.task_id, **position}
+                )
+    except Failure as exc:
+        result = exc.value
+        result["error"] = {**identities, **result["error"]}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        result = {"error": {"code": "invalid_input", "message": str(exc), **identities}}
+    if args.out:
+        try:
             Path(args.out).resolve().write_text(
                 json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result.get("state") not in {"failed", "cancelled"} else 1
-    except Failure as exc:
-        print(json.dumps(exc.value, ensure_ascii=False, indent=2))
-        return 1
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(
-            json.dumps(
-                {"error": {"code": "invalid_input", "message": str(exc)}},
-                ensure_ascii=False,
-            )
-        )
-        return 1
+        except OSError as exc:
+            result = {
+                "error": {"code": "output_failed", "message": str(exc), **identities},
+                "response": result,
+            }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return operation_exit(result)
 
 
 if __name__ == "__main__":
