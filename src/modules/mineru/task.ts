@@ -3,6 +3,8 @@ import { runMineruParse, MineruTaskError, type PreparedParse } from "./parse";
 import {
   PublicationRecoveryError,
   publishValidatedPackage,
+  type PublicationOwner,
+  type PublicationCompletion,
 } from "./publication";
 import {
   safeDiagnostic,
@@ -27,6 +29,12 @@ export type TaskState =
   | "cancelled";
 export type TaskSnapshot = PreparedParse & { source: Zotero.Item };
 export type TaskLifecycle = {
+  owner?: PublicationOwner;
+  acknowledgeCompletion?: (completion: PublicationCompletion) => Promise<void>;
+  acknowledgeReuse?: (item: Zotero.Item) => Promise<void>;
+  scratchDirectory?: string;
+  diagnosticsDirectory?: string;
+  onSnapshot?: (snapshot: TaskSnapshot) => Promise<void>;
   findReusable?: (snapshot: TaskSnapshot) => Promise<Zotero.Item | undefined>;
 };
 export type TaskView = {
@@ -146,6 +154,7 @@ export class MineruTaskController {
     let logs: TaskView["logs"];
     let configPath: string | undefined;
     let publicationErrorReported = false;
+    let scratchDirectory: string | undefined;
     const emit = (record?: PluginLogRecord, extra?: Partial<TaskView>) => {
       if (this.alive)
         report({ phase, state, snapshot, logs, configPath, record, ...extra });
@@ -224,13 +233,17 @@ export class MineruTaskController {
       checkCancelled();
       let reused: Zotero.Item | undefined;
       const parsed = await runMineruParse({
+        scratchDirectory: lifecycle.scratchDirectory,
+        diagnosticsDirectory: lifecycle.diagnosticsDirectory,
         pdfPath: path,
         runtime,
         options: frozenSettings.options,
         signal: abort.signal,
         onPreparedSnapshot: async (prepared) => {
           snapshot = { ...prepared, source };
+          await lifecycle.onSnapshot?.(snapshot);
           reused = await lifecycle.findReusable?.(snapshot);
+          if (reused) await lifecycle.acknowledgeReuse?.(reused);
           return !!reused;
         },
         onPrepared: () =>
@@ -260,7 +273,6 @@ export class MineruTaskController {
         },
       });
       if ("skipped" in parsed) {
-        checkCancelled();
         phase = "done";
         state = "succeeded";
         logs = undefined;
@@ -275,6 +287,7 @@ export class MineruTaskController {
         );
         return reused;
       }
+      scratchDirectory = parsed.taskDirectory;
       logs = { stdout: parsed.stdoutLog, stderr: parsed.stderrLog };
       checkCancelled();
       log("validation", "complete", "Result package validated");
@@ -282,6 +295,8 @@ export class MineruTaskController {
       phase = "saving";
       log(stage, "start", "Publishing the complete attachment");
       const result = await publishValidatedPackage({
+        owner: lifecycle.owner,
+        acknowledgeCompletion: lifecycle.acknowledgeCompletion,
         packageDirectory: parsed.packageDirectory,
         sourcePDF: source,
         signal: abort.signal,
@@ -417,9 +432,24 @@ export class MineruTaskController {
       }
       return undefined;
     } finally {
-      this.active = false;
-      this.abort = undefined;
-      this.reportCancellation = undefined;
+      try {
+        if (scratchDirectory)
+          await IOUtils.remove(scratchDirectory, {
+            recursive: true,
+            ignoreAbsent: true,
+          });
+      } catch (error) {
+        throw new MineruTaskError(
+          "cleanup",
+          "Sensitive task scratch cleanup failed",
+          logs,
+          error,
+        );
+      } finally {
+        this.active = false;
+        this.abort = undefined;
+        this.reportCancellation = undefined;
+      }
     }
   }
 }

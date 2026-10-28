@@ -28,6 +28,9 @@ export type ParseRequest = {
   options: ParseOptions;
   /** Shutdown signal; stopping the child prevents publication. */
   signal?: AbortSignal;
+  /** Private execution scratch and separately retained raw diagnostic logs. */
+  scratchDirectory?: string;
+  diagnosticsDirectory?: string;
   onPrepared?: () => void;
   onParseStart?: () => void;
   onValidation?: () => void;
@@ -65,7 +68,8 @@ export class MineruTaskError extends Error {
       | "environment"
       | "process"
       | "validation"
-      | "cancelled",
+      | "cancelled"
+      | "cleanup",
     message: string,
     public readonly logs?: { stdout: string; stderr: string },
     cause?: unknown,
@@ -156,14 +160,25 @@ export async function runMineruParse(
   ) {
     throw new MineruTaskError("input", "Invalid MinerU parse options");
   }
-  const root = taskDirectory();
+  const diagnostics = request.diagnosticsDirectory || taskDirectory();
+  const root =
+    request.scratchDirectory || PathUtils.join(diagnostics, "scratch");
+  let validated = false;
   const pdf = PathUtils.join(root, "input.pdf");
   const zip = PathUtils.join(root, "output.zip");
   const packageDirectory = PathUtils.join(root, "package");
-  const stdout = PathUtils.join(root, "stdout.log");
-  const stderr = PathUtils.join(root, "stderr.log");
+  const stdout = PathUtils.join(diagnostics, "stdout.log");
+  const stderr = PathUtils.join(diagnostics, "stderr.log");
   const config = PathUtils.join(root, "config.yaml");
   try {
+    await IOUtils.makeDirectory(diagnostics, {
+      createAncestors: true,
+      permissions: 0o700,
+    });
+    await IOUtils.makeDirectory(root, {
+      createAncestors: true,
+      permissions: 0o700,
+    });
     await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
     await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
     request.onLogs?.({ stdout, stderr });
@@ -287,11 +302,23 @@ export async function runMineruParse(
           throw error;
         });
       const [outcome, stdoutResult, stderrResult] = await Promise.allSettled([
-        child.wait(),
+        child.wait().catch(async (error) => {
+          await killChild();
+          throw error;
+        }),
         guardedDrain(child.stdout, stdout),
         guardedDrain(child.stderr, stderr),
       ]);
       if (termination) await termination;
+      if (cleanupErrors.length)
+        throw new MineruTaskError(
+          "cleanup",
+          "MinerU child termination could not be confirmed",
+          { stdout, stderr },
+          undefined,
+          undefined,
+          cleanupErrors,
+        );
       if (
         stdoutResult.status === "rejected" ||
         stderrResult.status === "rejected"
@@ -368,6 +395,7 @@ export async function runMineruParse(
     if (request.signal?.aborted) {
       throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
     }
+    validated = true;
     return {
       packageDirectory,
       taskDirectory: root,
@@ -385,5 +413,18 @@ export async function runMineruParse(
       stderr,
       error,
     );
+  } finally {
+    if (!validated) {
+      try {
+        await IOUtils.remove(root, { recursive: true, ignoreAbsent: true });
+      } catch (error) {
+        throw new MineruTaskError(
+          "cleanup",
+          "Sensitive task scratch cleanup failed",
+          { stdout, stderr },
+          error,
+        );
+      }
+    }
   }
 }
