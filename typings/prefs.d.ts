@@ -13,6 +13,7 @@ declare namespace _ZoteroTypes {
       "ocrMode": string;
       "imageAnalysis": boolean;
       "pageRange": string;
+      "queueLimit": number;
     };
   }
 }

@@ -108,7 +108,9 @@ it. Cleanup uncertainty pauses further execution.
 
 The plugin preference `queueLimit` is the sole admission capacity authority:
 default 10 **pending** tasks, excluding the active task. It must be a positive
-integer. Lowering it never evicts tasks. Capacity checks never assume speculative
+integer. The Preferences control accepts 1–2147483647, Zotero's native integer
+preference range; invalid values set outside that control cause 503
+`invalid_queue_limit`. Lowering it never evicts tasks. Capacity checks never assume speculative
 immediate dispatch. FIFO order, manual moves and pause changes are durable.
 Fresh and recovered startups are paused; admission does not implicitly resume.
 

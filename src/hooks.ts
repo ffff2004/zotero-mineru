@@ -3,9 +3,7 @@ import { registerPrefsScripts } from "./modules/preferenceScript";
 import { resolveSelectedPDF } from "./modules/mineru/task";
 import { mineruService } from "./modules/mineru/service";
 import { registerLocalAPI } from "./modules/mineru/localAPI";
-import { currentTaskSettings } from "./modules/mineru/settings";
-import { readCompatibleRuntime } from "./modules/mineru/runtime";
-import { safeDiagnostic } from "./modules/mineru/pluginLog";
+import { closeQueueWindow, openQueueWindow } from "./modules/mineru/queueUI";
 import { closeTaskWindows, createTaskWindow } from "./modules/mineru/ui";
 let unregisterAPI: (() => void) | undefined;
 
@@ -28,46 +26,84 @@ async function choosePDF(
 }
 
 async function runFromWindow(win: _ZoteroTypes.MainWindow): Promise<void> {
-  if (mineruService.busy) {
-    win.alert(getString("already-running"));
-    return;
-  }
   const items = (win as any).ZoteroPane.getSelectedItems() as Zotero.Item[];
-  const view = createTaskWindow();
+  const invalidDetails = (
+    invalid: { index: number; error: { code: string; message: string } }[],
+  ) =>
+    invalid
+      .map(
+        ({ index, error }) =>
+          `${index + 1}. ${items[index]?.getField("title") || items[index]?.key || ""}: ${error.code}: ${error.message}`,
+      )
+      .join("\n");
   try {
-    // Preserve the menu's runtime-first readiness check before opening a chooser.
-    const settings = currentTaskSettings();
-    try {
-      await readCompatibleRuntime(settings.descriptorPath || undefined);
-    } catch (error) {
-      throw new Error(
-        "MinerU runtime is missing or incompatible; run the companion installer",
-        { cause: error },
+    openQueueWindow();
+    if (items.length > 1) {
+      // The shared module resolves each parent and admits the entire valid subset
+      // atomically. Ambiguous parents are reported, never silently picked.
+      const batch = await mineruService.submitBatch({
+        requestID: crypto.randomUUID(),
+        items: items.map((item) => ({
+          requestID: crypto.randomUUID(),
+          source: { libraryID: item.libraryID, itemKey: item.key },
+        })),
+      });
+      win.alert(
+        [
+          getString("queue-batch-submitted", {
+            args: { count: batch.taskIDs.length },
+          }),
+          invalidDetails(batch.invalid),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      );
+    } else {
+      const source = await resolveSelectedPDF(items, (pdfs) =>
+        choosePDF(win, pdfs),
+      );
+      let report: ReturnType<typeof createTaskWindow> | undefined;
+      await mineruService.submit(
+        {
+          requestID: crypto.randomUUID(),
+          source: { libraryID: source.libraryID, itemKey: source.key },
+        },
+        (view) => {
+          // TaskView is execution-only. Do not show a misleading preparing log
+          // while queued, or leave an empty log window after rejected admission.
+          report ??= createTaskWindow();
+          report(view);
+        },
       );
     }
-    const source = await resolveSelectedPDF(items, (pdfs) =>
-      choosePDF(win, pdfs),
+  } catch (value) {
+    const error = value as {
+      code?: string;
+      message: string;
+      details?: {
+        remainingCapacity?: number;
+        requiredCapacity?: number;
+        invalid?: { index: number; error: { code: string; message: string } }[];
+      };
+    };
+    const details = error.details;
+    win.alert(
+      [
+        getString("queue-action-failed"),
+        `${error.code ? `${error.code}: ` : ""}${error.message}`,
+        error.code === "queue_full"
+          ? getString("queue-full", {
+              args: {
+                remaining: details?.remainingCapacity ?? 0,
+                required: details?.requiredCapacity ?? 1,
+              },
+            })
+          : "",
+        invalidDetails(details?.invalid || []),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     );
-    await mineruService.submit(
-      {
-        requestID: crypto.randomUUID(),
-        source: { libraryID: source.libraryID, itemKey: source.key },
-      },
-      view,
-    );
-  } catch (error) {
-    view({
-      phase: "failed",
-      state: "failed",
-      message: (error as Error).message,
-      record: {
-        timestamp: new Date().toISOString(),
-        stage: "task",
-        event: "failure",
-        message: (error as Error).message,
-        details: safeDiagnostic(error),
-      },
-    });
   }
 }
 
@@ -102,14 +138,28 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
   win.MozXULElement.insertFTLIfNeeded(
     `${addon.data.config.addonRef}-mainWindow.ftl`,
   );
-  ztoolkit.Menu.register("item", {
-    tag: "menuitem",
-    id: `zotero-itemmenu-${addon.data.config.addonRef}-run`,
-    label: getString("run-mineru"),
-    commandListener: () => {
-      void runFromWindow(win);
+  ztoolkit.Menu.register(
+    win.document.getElementById("menu_ToolsPopup") as XUL.MenuPopup,
+    {
+      tag: "menuitem",
+      id: `zotero-toolsmenu-${addon.data.config.addonRef}-queue`,
+      label: getString("queue-title"),
+      commandListener: () => {
+        openQueueWindow();
+      },
     },
-  });
+  );
+  ztoolkit.Menu.register(
+    win.document.getElementById("zotero-itemmenu") as XUL.MenuPopup,
+    {
+      tag: "menuitem",
+      id: `zotero-itemmenu-${addon.data.config.addonRef}-run`,
+      label: getString("run-mineru"),
+      commandListener: () => {
+        void runFromWindow(win);
+      },
+    },
+  );
 }
 
 async function onMainWindowUnload(_win: Window): Promise<void> {
@@ -120,6 +170,7 @@ function onShutdown(): void {
   unregisterAPI?.();
   unregisterAPI = undefined;
   mineruService.shutdown();
+  closeQueueWindow();
   closeTaskWindows();
   addon.data.alive = false;
   ztoolkit.unregisterAll();

@@ -33,37 +33,68 @@ describe("startup", function () {
     });
   }
 
-  it("runs the installed plugin menu handler in its bootstrap sandbox", async function () {
-    this.timeout(15000);
+  it("queues from the installed menu despite a bad runtime, without implicit resume; dequeue failure pauses", async function () {
+    this.timeout(20000);
+    const service = (Zotero[config.addonInstance] as any)
+      .api as import("../src/modules/mineru/service").MineruTaskService;
     const key = `${config.prefsPrefix}.runtimeDescriptor`;
     const previous = Zotero.Prefs.get(key, true);
     const win = Zotero.getMainWindow();
-    let dialog: Window | undefined;
+    const dir = Zotero.getTempDirectory();
+    dir.append(`mineru-startup-${Date.now()}`);
+    dir.create(Components.interfaces.nsIFile.DIRECTORY_TYPE, 0o700);
+    const path = PathUtils.join(dir.path, "paper.pdf");
+    await IOUtils.writeUTF8(path, "%PDF-1.4\n%%EOF\n");
+    const source = await Zotero.Attachments.importFromFile({
+      file: Zotero.File.pathToFile(path),
+      contentType: "application/pdf",
+    });
+    const waitFor = async (check: () => boolean) => {
+      const deadline = Date.now() + 10000;
+      while (!check() && Date.now() < deadline) await Zotero.Promise.delay(20);
+      assert.isTrue(check());
+    };
+    let taskID: string | undefined;
     try {
+      await service.pause();
       Zotero.Prefs.set(key, "/nonexistent/mineru-runtime.json", true);
+      await win.ZoteroPane.selectItem(source.id);
       const menu = win.document.getElementById(
         `zotero-itemmenu-${config.addonRef}-run`,
       );
       assert.isNotNull(menu);
       menu!.dispatchEvent(new win.Event("command"));
-      const deadline = Date.now() + 10000;
-      while (Date.now() < deadline) {
-        for (const candidate of Services.wm.getEnumerator(null)) {
-          const message =
-            candidate.document?.getElementById("mineru-plugin-log");
-          if (message?.textContent?.includes("companion installer")) {
-            dialog = candidate;
-            break;
-          }
-        }
-        if (dialog) break;
-        await Zotero.Promise.delay(50);
-      }
-      assert.isDefined(dialog, "menu reports the runtime failure to the user");
+      await waitFor(() => service.getQueue().pending.length === 1);
+      const task = service.getQueue().pending[0];
+      taskID = task.taskID;
+      assert.equal(task.state, "queued");
+      assert.isTrue(service.getQueue().paused);
+      assert.isUndefined(service.getQueue().activeTaskID);
+      await service.resume();
+      await waitFor(
+        () =>
+          service.getTask(task.taskID).state === "failed" &&
+          !service.getQueue().activeTaskID,
+      );
+      assert.isTrue(
+        service.getQueue().paused,
+        "environment failure pauses dispatch",
+      );
+      assert.include(service.getTask(task.taskID).error!.message, "runtime");
     } finally {
+      await service.pause();
+      if (taskID) await service.cancel(taskID);
       if (previous === undefined) Zotero.Prefs.clear(key, true);
       else Zotero.Prefs.set(key, previous, true);
-      dialog?.close();
+      for (const candidate of Services.wm.getEnumerator(null)) {
+        if (
+          candidate.document?.getElementById("mineru-queue") ||
+          candidate.document?.getElementById("mineru-plugin-log")
+        )
+          candidate.close();
+      }
+      await source.eraseTx();
+      dir.remove(true);
     }
   });
 });

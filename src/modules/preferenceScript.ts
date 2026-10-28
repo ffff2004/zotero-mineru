@@ -37,6 +37,32 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
   input("ocr").value = String(getPref("ocrMode") || "auto");
   input("images").checked = getPref("imageAnalysis") !== false;
   input("pages").value = String(getPref("pageRange") || "all");
+  const queueLimit = input("queue-limit");
+  const queueError = doc.getElementById("mineru-queue-limit-error")!;
+  queueLimit.value = String(getPref("queueLimit"));
+  const validateQueueLimit = (save: boolean) => {
+    const text = queueLimit.value.trim();
+    const value = Number(text);
+    const valid =
+      /^\d+$/.test(text) &&
+      Number.isSafeInteger(value) &&
+      value > 0 &&
+      value <= 2147483647;
+    queueLimit.setAttribute("aria-invalid", String(!valid));
+    queueError.textContent = valid ? "" : getString("queue-limit-invalid");
+    if (valid && save) {
+      try {
+        // Zotero integer preferences use signed 32-bit nsIPrefBranch storage.
+        setPref("queueLimit", value);
+        queueLimit.value = String(value);
+      } catch {
+        queueLimit.setAttribute("aria-invalid", "true");
+        queueError.textContent = getString("queue-limit-save-failed");
+      }
+    }
+  };
+  validateQueueLimit(false);
+  queueLimit.addEventListener("change", () => validateQueueLimit(true));
   const configPath = () => resolveCurrentMineruConfigPath(config.value.trim());
   let displayRequest = 0;
   const showEffective = async () => {
