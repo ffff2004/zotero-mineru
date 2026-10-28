@@ -170,261 +170,277 @@ export async function runMineruParse(
   const stdout = PathUtils.join(diagnostics, "stdout.log");
   const stderr = PathUtils.join(diagnostics, "stderr.log");
   const config = PathUtils.join(root, "config.yaml");
-  try {
-    await IOUtils.makeDirectory(diagnostics, {
-      createAncestors: true,
-      permissions: 0o700,
-    });
-    await IOUtils.makeDirectory(root, {
-      createAncestors: true,
-      permissions: 0o700,
-    });
-    await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
-    await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
-    request.onLogs?.({ stdout, stderr });
-    const source = Zotero.File.pathToFile(request.pdfPath);
-    if (!source.exists() || !source.isFile() || source.isSymlink()) {
-      throw taskError("input", "Source PDF is unavailable", stdout, stderr);
-    }
-    await IOUtils.copy(request.pdfPath, pdf, { noOverwrite: true });
-    const sha256 = await IOUtils.computeHexDigest(pdf, "sha256");
-    if (
-      !(await IOUtils.exists(request.runtime.configPath)) ||
-      !Zotero.File.pathToFile(request.runtime.configPath).isFile()
-    ) {
-      throw taskError(
-        "environment",
-        "MinerU configuration file is missing",
-        stdout,
-        stderr,
-      );
-    }
-    // The child reads these exact bytes, even if preferences or the original
-    // configuration change while result lookup or parsing is in progress.
-    await IOUtils.copy(request.runtime.configPath, config, {
-      noOverwrite: true,
-    });
-    const configurationSha256 = await IOUtils.computeHexDigest(
-      config,
-      "sha256",
-    );
-    const runtime: RuntimeSnapshot = {
-      ...request.runtime,
-      childEnvironment: { MINERU_CONFIG: config },
-    };
-    const frozenEnvironment = await freezeParseEnvironment(config);
-    if (await IOUtils.exists(zip)) {
-      throw taskError(
-        "validation",
-        "Task output ZIP already exists",
-        stdout,
-        stderr,
-      );
-    }
-    if (request.signal?.aborted) {
-      throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
-    }
-    request.onPrepared?.();
-    if (
-      "onPreparedSnapshot" in request &&
-      (await request.onPreparedSnapshot({
-        inputSha256: sha256,
-        requestedOptions: options,
-        runtime,
-        configurationSha256,
-        environmentSha256: frozenEnvironment.sha256,
-      }))
-    ) {
-      await IOUtils.remove(root, { recursive: true });
-      return { skipped: true };
-    }
-    if (request.signal?.aborted) {
-      throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
-    }
-    request.onParseStart?.();
-    let child: Child;
+  const execute = async (): Promise<ValidatedParse | SkippedParse> => {
     try {
-      const { Subprocess } = ChromeUtils.importESModule(
-        "resource://gre/modules/Subprocess.sys.mjs",
-      ) as { Subprocess: SubprocessAPI };
-      child = await Subprocess.call({
-        command: request.runtime.descriptor.mineru_kit,
-        arguments: childArguments(pdf, zip, options),
-        environment: {
-          ...frozenEnvironment.environment,
-          MINERU_CONFIG: runtime.childEnvironment.MINERU_CONFIG,
-        },
-        environmentAppend: false,
-        stderr: "pipe",
+      await IOUtils.makeDirectory(diagnostics, {
+        createAncestors: true,
+        permissions: 0o700,
       });
-    } catch (error) {
-      throw taskError(
-        "process",
-        "Could not start MinerU; check the runtime executable",
-        stdout,
-        stderr,
-        error,
-      );
-    }
-    let stopped = false;
-    const cleanupErrors: unknown[] = [];
-    let termination: Promise<void> | undefined;
-    const killChild = () =>
-      (termination ??= child.kill().then(
-        () => undefined,
-        (error) => {
-          cleanupErrors.push(error);
-        },
-      ));
-    const processError = (
-      message: string,
-      cause?: unknown,
-      exitCode?: number,
-    ) =>
-      new MineruTaskError(
-        "process",
-        message,
-        { stdout, stderr },
-        cause,
-        exitCode,
-        cleanupErrors,
-      );
-    const stop = () => {
-      stopped = true;
-      void killChild();
-    };
-    request.signal?.addEventListener("abort", stop, { once: true });
-    if (request.signal?.aborted) stop();
-    try {
-      const guardedDrain = (pipe: Pipe, path: string) =>
-        drain(pipe, path).catch(async (error) => {
-          await killChild();
-          throw error;
-        });
-      const [outcome, stdoutResult, stderrResult] = await Promise.allSettled([
-        child.wait().catch(async (error) => {
-          await killChild();
-          throw error;
-        }),
-        guardedDrain(child.stdout, stdout),
-        guardedDrain(child.stderr, stderr),
-      ]);
-      if (termination) await termination;
-      if (cleanupErrors.length)
-        throw new MineruTaskError(
-          "cleanup",
-          "MinerU child termination could not be confirmed",
-          { stdout, stderr },
-          undefined,
-          undefined,
-          cleanupErrors,
-        );
+      await IOUtils.makeDirectory(root, {
+        createAncestors: true,
+        permissions: 0o700,
+      });
+      await IOUtils.write(stdout, new Uint8Array(), { mode: "create" });
+      await IOUtils.write(stderr, new Uint8Array(), { mode: "create" });
+      request.onLogs?.({ stdout, stderr });
+      const source = Zotero.File.pathToFile(request.pdfPath);
+      if (!source.exists() || !source.isFile() || source.isSymlink()) {
+        throw taskError("input", "Source PDF is unavailable", stdout, stderr);
+      }
+      await IOUtils.copy(request.pdfPath, pdf, { noOverwrite: true });
+      const sha256 = await IOUtils.computeHexDigest(pdf, "sha256");
       if (
-        stdoutResult.status === "rejected" ||
-        stderrResult.status === "rejected"
-      ) {
-        await killChild();
-        const errors = [stdoutResult, stderrResult].flatMap((result) =>
-          result.status === "rejected" ? [result.reason] : [],
-        );
-        if (outcome.status === "rejected") errors.push(outcome.reason);
-        throw processError(
-          "Could not record MinerU output; check disk access",
-          errors.length === 1
-            ? errors[0]
-            : new AggregateError(errors, "CLI stream recording failed"),
-          outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
-        );
-      }
-      if (stopped && outcome.status === "fulfilled" && !cleanupErrors.length) {
-        throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
-      }
-      if (
-        outcome.status === "rejected" ||
-        stopped ||
-        outcome.value.exitCode < 0
-      ) {
-        throw processError(
-          "MinerU process ended abnormally; inspect the CLI logs",
-          outcome.status === "rejected" ? outcome.reason : undefined,
-          outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
-        );
-      }
-      if (outcome.value.exitCode !== 0) {
-        throw processError(
-          "MinerU 解析失败",
-          undefined,
-          outcome.value.exitCode,
-        );
-      }
-    } finally {
-      request.signal?.removeEventListener("abort", stop);
-    }
-    request.onValidation?.();
-    try {
-      if (
-        !(await IOUtils.exists(zip)) ||
-        !Zotero.File.pathToFile(zip).isFile()
+        !(await IOUtils.exists(request.runtime.configPath)) ||
+        !Zotero.File.pathToFile(request.runtime.configPath).isFile()
       ) {
         throw taskError(
-          "validation",
-          "MinerU output ZIP is missing",
+          "environment",
+          "MinerU configuration file is missing",
           stdout,
           stderr,
         );
       }
-      await extractValidatedPackage(
-        zip,
-        packageDirectory,
-        runtime,
-        sha256,
-        options,
-        configurationSha256,
-        frozenEnvironment.sha256,
+      // The child reads these exact bytes, even if preferences or the original
+      // configuration change while result lookup or parsing is in progress.
+      await IOUtils.copy(request.runtime.configPath, config, {
+        noOverwrite: true,
+      });
+      const configurationSha256 = await IOUtils.computeHexDigest(
+        config,
+        "sha256",
       );
+      const runtime: RuntimeSnapshot = {
+        ...request.runtime,
+        childEnvironment: { MINERU_CONFIG: config },
+      };
+      const frozenEnvironment = await freezeParseEnvironment(config);
+      if (await IOUtils.exists(zip)) {
+        throw taskError(
+          "validation",
+          "Task output ZIP already exists",
+          stdout,
+          stderr,
+        );
+      }
+      if (request.signal?.aborted) {
+        throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
+      }
+      request.onPrepared?.();
+      if (
+        "onPreparedSnapshot" in request &&
+        (await request.onPreparedSnapshot({
+          inputSha256: sha256,
+          requestedOptions: options,
+          runtime,
+          configurationSha256,
+          environmentSha256: frozenEnvironment.sha256,
+        }))
+      ) {
+        await IOUtils.remove(root, { recursive: true });
+        return { skipped: true };
+      }
+      if (request.signal?.aborted) {
+        throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
+      }
+      request.onParseStart?.();
+      let child: Child;
+      try {
+        const { Subprocess } = ChromeUtils.importESModule(
+          "resource://gre/modules/Subprocess.sys.mjs",
+        ) as { Subprocess: SubprocessAPI };
+        child = await Subprocess.call({
+          command: request.runtime.descriptor.mineru_kit,
+          arguments: childArguments(pdf, zip, options),
+          environment: {
+            ...frozenEnvironment.environment,
+            MINERU_CONFIG: runtime.childEnvironment.MINERU_CONFIG,
+          },
+          environmentAppend: false,
+          stderr: "pipe",
+        });
+      } catch (error) {
+        throw taskError(
+          "environment",
+          "Could not start MinerU; check the runtime executable",
+          stdout,
+          stderr,
+          error,
+        );
+      }
+      let stopped = false;
+      const cleanupErrors: unknown[] = [];
+      let termination: Promise<void> | undefined;
+      const killChild = () =>
+        (termination ??= child.kill().then(
+          () => undefined,
+          (error) => {
+            cleanupErrors.push(error);
+          },
+        ));
+      const processError = (
+        message: string,
+        cause?: unknown,
+        exitCode?: number,
+      ) =>
+        new MineruTaskError(
+          "process",
+          message,
+          { stdout, stderr },
+          cause,
+          exitCode,
+          cleanupErrors,
+        );
+      const stop = () => {
+        stopped = true;
+        void killChild();
+      };
+      request.signal?.addEventListener("abort", stop, { once: true });
+      if (request.signal?.aborted) stop();
+      try {
+        const guardedDrain = (pipe: Pipe, path: string) =>
+          drain(pipe, path).catch(async (error) => {
+            await killChild();
+            throw error;
+          });
+        const [outcome, stdoutResult, stderrResult] = await Promise.allSettled([
+          child.wait().catch(async (error) => {
+            await killChild();
+            throw error;
+          }),
+          guardedDrain(child.stdout, stdout),
+          guardedDrain(child.stderr, stderr),
+        ]);
+        if (termination) await termination;
+        if (cleanupErrors.length)
+          throw new MineruTaskError(
+            "cleanup",
+            "MinerU child termination could not be confirmed",
+            { stdout, stderr },
+            undefined,
+            undefined,
+            cleanupErrors,
+          );
+        if (
+          stdoutResult.status === "rejected" ||
+          stderrResult.status === "rejected"
+        ) {
+          await killChild();
+          const errors = [stdoutResult, stderrResult].flatMap((result) =>
+            result.status === "rejected" ? [result.reason] : [],
+          );
+          if (outcome.status === "rejected") errors.push(outcome.reason);
+          throw processError(
+            "Could not record MinerU output; check disk access",
+            errors.length === 1
+              ? errors[0]
+              : new AggregateError(errors, "CLI stream recording failed"),
+            outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
+          );
+        }
+        if (
+          stopped &&
+          outcome.status === "fulfilled" &&
+          !cleanupErrors.length
+        ) {
+          throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
+        }
+        if (
+          outcome.status === "rejected" ||
+          stopped ||
+          outcome.value.exitCode < 0
+        ) {
+          throw processError(
+            "MinerU process ended abnormally; inspect the CLI logs",
+            outcome.status === "rejected" ? outcome.reason : undefined,
+            outcome.status === "fulfilled" ? outcome.value.exitCode : undefined,
+          );
+        }
+        if (outcome.value.exitCode !== 0) {
+          throw processError(
+            "MinerU 解析失败",
+            undefined,
+            outcome.value.exitCode,
+          );
+        }
+      } finally {
+        request.signal?.removeEventListener("abort", stop);
+      }
+      request.onValidation?.();
+      try {
+        if (
+          !(await IOUtils.exists(zip)) ||
+          !Zotero.File.pathToFile(zip).isFile()
+        ) {
+          throw taskError(
+            "validation",
+            "MinerU output ZIP is missing",
+            stdout,
+            stderr,
+          );
+        }
+        await extractValidatedPackage(
+          zip,
+          packageDirectory,
+          runtime,
+          sha256,
+          options,
+          configurationSha256,
+          frozenEnvironment.sha256,
+        );
+      } catch (error) {
+        if (error instanceof MineruTaskError) throw error;
+        throw taskError(
+          "validation",
+          "MinerU result package is invalid; inspect diagnostic details",
+          stdout,
+          stderr,
+          error,
+        );
+      }
+      if (request.signal?.aborted) {
+        throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
+      }
+      validated = true;
+      return {
+        packageDirectory,
+        taskDirectory: root,
+        stdoutLog: stdout,
+        stderrLog: stderr,
+        inputSha256: sha256,
+        requestedOptions: options,
+      };
     } catch (error) {
       if (error instanceof MineruTaskError) throw error;
       throw taskError(
-        "validation",
-        "MinerU result package is invalid; inspect diagnostic details",
+        "input",
+        "Could not prepare MinerU task; check file access and disk space",
         stdout,
         stderr,
         error,
       );
     }
-    if (request.signal?.aborted) {
-      throw taskError("cancelled", "MinerU task stopped", stdout, stderr);
-    }
-    validated = true;
-    return {
-      packageDirectory,
-      taskDirectory: root,
-      stdoutLog: stdout,
-      stderrLog: stderr,
-      inputSha256: sha256,
-      requestedOptions: options,
-    };
+  };
+  let outcome: ValidatedParse | SkippedParse | undefined;
+  let failure: unknown;
+  try {
+    outcome = await execute();
   } catch (error) {
-    if (error instanceof MineruTaskError) throw error;
-    throw taskError(
-      "input",
-      "Could not prepare MinerU task; check file access and disk space",
-      stdout,
-      stderr,
-      error,
-    );
-  } finally {
-    if (!validated) {
-      try {
-        await IOUtils.remove(root, { recursive: true, ignoreAbsent: true });
-      } catch (error) {
-        throw new MineruTaskError(
-          "cleanup",
-          "Sensitive task scratch cleanup failed",
-          { stdout, stderr },
-          error,
-        );
-      }
+    failure = error;
+  }
+  if (!validated) {
+    try {
+      await IOUtils.remove(root, { recursive: true, ignoreAbsent: true });
+    } catch (error) {
+      throw new MineruTaskError(
+        "cleanup",
+        "Sensitive task scratch cleanup failed",
+        { stdout, stderr },
+        error,
+        undefined,
+        failure ? [failure] : undefined,
+      );
     }
   }
+  if (failure) throw failure;
+  return outcome!;
 }

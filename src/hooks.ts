@@ -1,6 +1,5 @@
 import { getString, initLocale } from "./utils/locale";
 import { registerPrefsScripts } from "./modules/preferenceScript";
-import { recoverIncompletePublications } from "./modules/mineru/publication";
 import { resolveSelectedPDF } from "./modules/mineru/task";
 import { mineruService } from "./modules/mineru/service";
 import { registerLocalAPI } from "./modules/mineru/localAPI";
@@ -85,17 +84,14 @@ async function onStartup(): Promise<void> {
     label: getString("prefs-title"),
     image: `chrome://${addon.data.config.addonRef}/content/icons/favicon.png`,
   });
-  let recoveryReady = true;
   try {
-    await recoverIncompletePublications();
+    await mineruService.initialize();
   } catch (error) {
-    recoveryReady = false;
     Zotero.logError(error as Error);
     new ztoolkit.ProgressWindow(addon.data.config.addonName)
       .createLine({ text: getString("recovery-failed"), type: "fail" })
       .show();
   }
-  mineruService.setReady(recoveryReady);
   unregisterAPI = registerLocalAPI();
   addon.api = mineruService;
   for (const win of Zotero.getMainWindows()) await onMainWindowLoad(win);

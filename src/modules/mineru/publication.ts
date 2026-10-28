@@ -393,6 +393,14 @@ async function recoverOne(
   };
   if (journal.phase === "committed") {
     if (journal.version === 2) {
+      if (
+        !identity ||
+        !/^[A-Z0-9]{8}$/.test(identity.key) ||
+        !Number.isSafeInteger(identity.id) ||
+        identity.id <= 0 ||
+        !Number.isSafeInteger(identity.libraryID)
+      )
+        throw new Error("Invalid correlated committed identity");
       const item =
         journal.identity &&
         (await Zotero.Items.getByLibraryAndKeyAsync(
