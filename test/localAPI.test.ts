@@ -1302,87 +1302,198 @@ describe("MinerU shared task service and local HTTP API", function () {
   });
 
   it("bounds terminal history and batch manifests, expires replay registrations, and preserves unfinished work", async function () {
-    const f = await fixture("", true);
+    const f = await fixture();
     try {
+      const publishedRequest = {
+        requestID: "history-result",
+        source: f.sourceID,
+      };
+      const published = await terminal(
+        f.service,
+        (await f.service.submit(publishedRequest)).taskID,
+      );
+      assert.equal(
+        published.state,
+        "succeeded",
+        JSON.stringify(published.error),
+      );
+      await f.service.pause();
+      const sourcePath = (await f.source.getFilePathAsync()) as string;
+      const sourceContents = await IOUtils.readUTF8(sourcePath);
+      const resultPath = published.result!.paths.markdown!;
+      const resultContents = await IOUtils.readUTF8(resultPath);
+
+      const requests = new Map([[published.taskID, publishedRequest]]);
+      const diagnostics = (taskID: string) =>
+        PathUtils.join(f.storageRoot, "diagnostics", taskID);
+      const seedDiagnostics = async (taskID: string) => {
+        await IOUtils.makeDirectory(diagnostics(taskID), {
+          createAncestors: true,
+        });
+        await IOUtils.writeUTF8(
+          PathUtils.join(diagnostics(taskID), "retention-fixture.log"),
+          "raw diagnostic fixture",
+        );
+      };
+      await seedDiagnostics(published.taskID);
       const owning = await f.service.submitBatch({
         requestID: "unfinished-owner",
         items: [{ requestID: "unfinished", source: f.sourceID }],
       });
       const unfinished = owning.tasks[0];
-      const firstBatch = await f.service.submitBatch({
-        requestID: "history-0",
-        items: [{ requestID: "history-task-0", source: f.sourceID }],
-      });
-      await f.service.cancelBatch(firstBatch.batchID);
-      const oldDiagnostics = PathUtils.join(
-        f.storageRoot,
-        "diagnostics",
-        firstBatch.taskIDs[0],
-      );
-      await IOUtils.makeDirectory(oldDiagnostics, { createAncestors: true });
-      await IOUtils.writeUTF8(
-        PathUtils.join(oldDiagnostics, "stdout.log"),
-        "raw diagnostic fixture",
-      );
-      const completed = [firstBatch];
-      for (let index = 1; index <= 100; index++) {
+      const completed = [];
+      for (let index = 0; index < 100; index++) {
+        // Cancel the first pair together to allow equal completion timestamps.
+        // Neither public retention nor queue ordering specifies a tie victim.
+        const items = (
+          index === 0
+            ? ["history-task-0", "history-task-pair"]
+            : [`history-task-${index}`]
+        ).map((requestID) => ({ requestID, source: f.sourceID }));
         const batch = await f.service.submitBatch({
           requestID: `history-${index}`,
-          items: [{ requestID: `history-task-${index}`, source: f.sourceID }],
+          items,
         });
+        for (const [itemIndex, taskID] of batch.taskIDs.entries()) {
+          requests.set(taskID, items[itemIndex]);
+          await seedDiagnostics(taskID);
+        }
         await f.service.cancelBatch(batch.batchID);
         completed.push(batch);
       }
+      // A replay-only wrapper counts toward the separate manifest bound without
+      // adding another terminal task that would force both early pair members out.
+      const wrapper = await f.service.submitBatch({
+        requestID: "history-wrapper",
+        items: [requests.get(completed.at(-1)!.taskIDs[0])!],
+      });
+      assert.deepEqual(wrapper.taskIDs, completed.at(-1)!.taskIDs);
+      completed.push(wrapper);
+      const recent = f.service.getQueue().recent;
+      assert.lengthOf(recent, 100);
+      const retained = new Set(recent.map((task) => task.taskID));
+      const evicted = [...requests.keys()].filter((id) => !retained.has(id));
+      assert.lengthOf(evicted, requests.size - 100);
+      assert.include(
+        evicted,
+        published.taskID,
+        "exercise successful-task history eviction before checking its attachment",
+      );
+      // Cancellation acknowledges the durable mutation and its diagnostic cleanup;
+      // no separate timer or cleanup grace period is part of this contract.
+      for (const taskID of requests.keys()) {
+        if (retained.has(taskID)) {
+          assert.include(
+            ["succeeded", "cancelled"],
+            f.service.get(taskID).state,
+          );
+          assert.equal(
+            await IOUtils.readUTF8(
+              PathUtils.join(diagnostics(taskID), "retention-fixture.log"),
+            ),
+            "raw diagnostic fixture",
+            `retained task keeps diagnostics: ${taskID}`,
+          );
+        } else {
+          assert.propertyVal(
+            assert.throws(() => f.service.get(taskID), MineruAPIError),
+            "code",
+            "task_not_found",
+          );
+          assert.isFalse(
+            await IOUtils.exists(diagnostics(taskID)),
+            `evicted task loses diagnostics: ${taskID}`,
+          );
+        }
+      }
+      assert.equal(f.service.get(unfinished.taskID).state, "queued");
+      assert.deepEqual(
+        f.service.getQueue().pending.map((task) => task.taskID),
+        owning.taskIDs,
+      );
       assert.equal(
         f.service.getBatch(owning.batchID).tasks[0].state,
         "queued",
         "owning unfinished manifests outlive bounded wrappers",
       );
-      assert.isFalse(
-        await IOUtils.exists(oldDiagnostics),
-        "eviction removes private logs, not attachments",
+      assert.propertyVal(
+        assert.throws(
+          () => f.service.getBatch(completed[0].batchID),
+          MineruAPIError,
+        ),
+        "code",
+        "batch_not_found",
       );
-      assert.lengthOf(f.service.getQueue().recent, 100);
-      assert.equal(f.service.get(unfinished.taskID).state, "queued");
-      try {
-        f.service.get(firstBatch.taskIDs[0]);
-        assert.fail("terminal retention is bounded");
-      } catch (error) {
-        assert.equal((error as MineruAPIError).code, "task_not_found");
-      }
-      try {
-        f.service.getBatch(firstBatch.batchID);
-        assert.fail("batch metadata is bounded");
-      } catch (error) {
-        assert.equal((error as MineruAPIError).code, "batch_not_found");
-      }
-      const fresh = await f.service.submit({
-        requestID: "history-task-0",
-        source: f.sourceID,
-      });
-      assert.notEqual(fresh.taskID, firstBatch.taskIDs[0]);
-      const oldest = f.service.getQueue().recent.at(-1)!.taskID;
-      const oldestIndex = completed.findIndex((batch) =>
-        batch.taskIDs.includes(oldest),
+      for (const batch of completed.slice(-100))
+        assert.equal(f.service.getBatch(batch.batchID).batchID, batch.batchID);
+
+      const expiredID = evicted.find((id) => id !== published.taskID)!;
+      const fresh = await f.service.submit(requests.get(expiredID)!);
+      assert.notEqual(
+        fresh.taskID,
+        expiredID,
+        "eviction expires task replay registration",
       );
+      assert.equal(fresh.state, "queued");
+      // Index every retained task, not a predicted oldest tie member. Observe which
+      // member actually expires on the next terminal-history eviction.
       const indexed = await f.service.submitBatch({
         requestID: "partial",
-        items: [
-          { requestID: `history-task-${oldestIndex}`, source: f.sourceID },
-        ],
+        items: recent.map((task) => requests.get(task.taskID)!),
       });
+      assert.sameMembers(indexed.taskIDs, [...retained]);
+      assert.isFalse(indexed.partialHistory);
       await f.service.cancel(fresh.taskID);
-      // Another terminal eviction expires this thin manifest's oldest member.
-      assert.isTrue(
-        f.service.getBatch(indexed.batchID).partialHistory,
-        JSON.stringify({
-          indexed,
-          queue: f.service.getQueue().recent.slice(-3),
-        }),
+      const remaining = new Set(
+        f.service.getQueue().recent.map((task) => task.taskID),
       );
-      assert.deepEqual(
-        f.service.getBatch(indexed.batchID).expiredTaskIDs,
-        indexed.taskIDs,
+      assert.equal(remaining.size, 100);
+      const expiredMembers = indexed.taskIDs.filter((id) => !remaining.has(id));
+      assert.lengthOf(expiredMembers, 1);
+      const partial = f.service.getBatch(indexed.batchID);
+      assert.isTrue(partial.partialHistory);
+      assert.sameMembers(partial.expiredTaskIDs, expiredMembers);
+      assert.sameMembers(
+        partial.tasks.map((task) => task.taskID),
+        indexed.taskIDs.filter((id) => remaining.has(id)),
+      );
+      for (const taskID of expiredMembers) {
+        assert.propertyVal(
+          assert.throws(() => f.service.get(taskID), MineruAPIError),
+          "code",
+          "task_not_found",
+        );
+        assert.isFalse(await IOUtils.exists(diagnostics(taskID)));
+      }
+
+      const source = await Zotero.Items.getByLibraryAndKeyAsync(
+        f.source.libraryID,
+        f.source.key,
+      );
+      assert.isOk(
+        source,
+        "history eviction preserves the source attachment item",
+      );
+      assert.isFalse(source.deleted);
+      assert.equal(await source.getFilePathAsync(), sourcePath);
+      assert.equal(await IOUtils.readUTF8(sourcePath), sourceContents);
+      const result = await Zotero.Items.getByLibraryAndKeyAsync(
+        published.result!.libraryID,
+        published.result!.itemKey,
+      );
+      assert.isOk(
+        result,
+        "history eviction preserves the published attachment item",
+      );
+      assert.isFalse(result.deleted);
+      assert.equal(await result.getFilePathAsync(), resultPath);
+      assert.equal(await IOUtils.readUTF8(resultPath), resultContents);
+      const found = await f.service.results(f.sourceID);
+      assert.equal(
+        found.results.find(
+          (item) => item.itemKey === published.result!.itemKey,
+        )!.availability,
+        "valid",
       );
     } finally {
       await f.clean();
