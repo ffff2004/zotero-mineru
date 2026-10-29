@@ -48,16 +48,18 @@ async function runFromWindow(win: _ZoteroTypes.MainWindow): Promise<void> {
           source: { libraryID: item.libraryID, itemKey: item.key },
         })),
       });
-      win.alert(
-        [
-          getString("queue-batch-submitted", {
-            args: { count: batch.taskIDs.length },
-          }),
-          invalidDetails(batch.invalid),
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      );
+      if (batch.invalid.length > 0) {
+        win.alert(
+          [
+            getString("queue-batch-submitted", {
+              args: { count: batch.taskIDs.length },
+            }),
+            invalidDetails(batch.invalid),
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+      }
     } else {
       const source = await resolveSelectedPDF(items, (pdfs) =>
         choosePDF(win, pdfs),
