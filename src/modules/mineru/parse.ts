@@ -189,31 +189,35 @@ export async function runMineruParse(
       }
       await IOUtils.copy(request.pdfPath, pdf, { noOverwrite: true });
       const sha256 = await IOUtils.computeHexDigest(pdf, "sha256");
-      if (
-        !(await IOUtils.exists(request.runtime.configPath)) ||
-        !Zotero.File.pathToFile(request.runtime.configPath).isFile()
-      ) {
+      let configurationSha256: string;
+      let frozenEnvironment: Awaited<ReturnType<typeof freezeParseEnvironment>>;
+      try {
+        if (
+          !(await IOUtils.exists(request.runtime.configPath)) ||
+          !Zotero.File.pathToFile(request.runtime.configPath).isFile()
+        ) {
+          throw new Error("MinerU configuration file is missing");
+        }
+        // The child reads these exact bytes, even if preferences or the original
+        // configuration change while result lookup or parsing is in progress.
+        await IOUtils.copy(request.runtime.configPath, config, {
+          noOverwrite: true,
+        });
+        configurationSha256 = await IOUtils.computeHexDigest(config, "sha256");
+        frozenEnvironment = await freezeParseEnvironment(config);
+      } catch (error) {
         throw taskError(
           "environment",
-          "MinerU configuration file is missing",
+          "Could not prepare shared MinerU configuration; check configuration access and disk space",
           stdout,
           stderr,
+          error,
         );
       }
-      // The child reads these exact bytes, even if preferences or the original
-      // configuration change while result lookup or parsing is in progress.
-      await IOUtils.copy(request.runtime.configPath, config, {
-        noOverwrite: true,
-      });
-      const configurationSha256 = await IOUtils.computeHexDigest(
-        config,
-        "sha256",
-      );
       const runtime: RuntimeSnapshot = {
         ...request.runtime,
         childEnvironment: { MINERU_CONFIG: config },
       };
-      const frozenEnvironment = await freezeParseEnvironment(config);
       if (await IOUtils.exists(zip)) {
         throw taskError(
           "validation",

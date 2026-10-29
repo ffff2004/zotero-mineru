@@ -193,6 +193,9 @@ startup/recovery/storage/configuration prerequisites 503.
 
 Background failures are task records queried with HTTP 200. Inspect `state`
 and `error`, not HTTP status alone. Input/process/validation failures continue
-with the next task. Observed shared runtime failures mark the task failed and
-pause; unsafe cleanup/termination or publication recovery failures block further
+with the next task. Observed shared runtime or configuration preparation failures
+(including configuration copy, hash or environment-read access errors) mark the
+task failed and pause, preserving pending work until repair and explicit resume;
+source-PDF access failures remain individual input failures. Unsafe
+cleanup/termination or publication recovery failures block further
 execution pending repair/restart. There is no automatic retry.

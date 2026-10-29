@@ -1023,6 +1023,128 @@ describe("MinerU shared task service and local HTTP API", function () {
     }
   });
 
+  for (const fault of ["copy", "hash", "read"] as const) {
+    it(`pauses the real queue on shared configuration ${fault} failure until repair and explicit resume`, async function () {
+      const f = await fixture("", true);
+      const copy = IOUtils.copy,
+        hash = IOUtils.computeHexDigest,
+        read = IOUtils.readUTF8;
+      try {
+        const first = await f.service.submit({
+          requestID: "config-fault",
+          source: f.sourceID,
+        });
+        const next = await f.service.submit({
+          requestID: "after-config-repair",
+          source: f.sourceID,
+        });
+        IOUtils.copy = async (source, target, ...args) => {
+          if (fault === "copy" && source === f.configPath)
+            throw new Error(
+              "external config access fault: secret=never-persist",
+            );
+          return copy.call(IOUtils, source, target, ...args);
+        };
+        IOUtils.computeHexDigest = async (path, ...args) => {
+          if (fault === "hash" && path.endsWith("config.yaml"))
+            throw new Error("external config hash fault");
+          return hash.call(IOUtils, path, ...args);
+        };
+        IOUtils.readUTF8 = async (path, ...args) => {
+          if (fault === "read" && path.endsWith("config.yaml"))
+            throw new Error("external config read fault");
+          return read.call(IOUtils, path, ...args);
+        };
+        await f.service.resume();
+        const failed = await terminal(f.service, first.taskID);
+        assert.equal(failed.state, "failed");
+        assert.equal(failed.error!.category, "environment");
+        assert.isTrue(f.service.getQueue().paused);
+        assert.equal(f.service.get(next.taskID).state, "queued");
+        assert.isFalse(
+          await IOUtils.exists(PathUtils.join(f.dir.path, "calls")),
+        );
+        assert.notInclude(
+          await read.call(IOUtils, PathUtils.join(f.storageRoot, "queue.json")),
+          "never-persist",
+        );
+        IOUtils.copy = copy;
+        IOUtils.computeHexDigest = hash;
+        IOUtils.readUTF8 = read;
+        await IOUtils.writeUTF8(f.configPath, "# repaired latest config\n{}\n");
+        Zotero.Prefs.set(`${config.prefsPrefix}.imageAnalysis`, false, true);
+        assert.equal(
+          (
+            await f.service.submit({
+              requestID: "config-fault",
+              source: f.sourceID,
+            })
+          ).state,
+          "failed",
+        );
+        assert.equal(
+          f.service.get(next.taskID).state,
+          "queued",
+          "repair and replay do not resume or retry",
+        );
+        await f.service.resume();
+        const done = await terminal(f.service, next.taskID);
+        assert.equal(done.state, "succeeded");
+        assert.isFalse(done.execution!.options.image_analysis);
+        assert.equal(
+          done.execution!.configurationSha256,
+          await hash.call(IOUtils, f.configPath, "sha256"),
+        );
+        assert.equal(f.service.get(first.taskID).state, "failed");
+        assert.equal(
+          (
+            await read.call(IOUtils, PathUtils.join(f.dir.path, "calls"))
+          ).trim(),
+          "called",
+        );
+      } finally {
+        IOUtils.copy = copy;
+        IOUtils.computeHexDigest = hash;
+        IOUtils.readUTF8 = read;
+        await f.clean();
+      }
+    });
+  }
+
+  it("continues after a source-specific PDF copy access failure", async function () {
+    const f = await fixture("", true);
+    const copy = IOUtils.copy;
+    try {
+      const sourcePath = await f.source.getFilePathAsync();
+      const first = await f.service.submit({
+        requestID: "pdf-copy-fault",
+        source: f.sourceID,
+      });
+      const next = await f.service.submit({
+        requestID: "pdf-copy-next",
+        source: f.sourceID,
+      });
+      let failedOnce = false;
+      IOUtils.copy = async (source, target, ...args) => {
+        if (source === sourcePath && !failedOnce) {
+          failedOnce = true;
+          throw new Error("external PDF access fault");
+        }
+        return copy.call(IOUtils, source, target, ...args);
+      };
+      await f.service.resume();
+      assert.equal(
+        (await terminal(f.service, first.taskID)).error!.category,
+        "input",
+      );
+      assert.equal((await terminal(f.service, next.taskID)).state, "succeeded");
+      assert.isFalse(f.service.getQueue().paused);
+    } finally {
+      IOUtils.copy = copy;
+      await f.clean();
+    }
+  });
+
   it("continues after an individual input failure but pauses after an observed shared runtime failure", async function () {
     const f = await fixture("", true);
     try {
