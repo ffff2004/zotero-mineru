@@ -7,6 +7,7 @@ import {
 } from "../src/modules/mineru/service";
 import { localAPIBase, registerLocalAPI } from "../src/modules/mineru/localAPI";
 import { MineruAPIError } from "../src/modules/mineru/apiError";
+import type { PublicationCompletion } from "../src/modules/mineru/publication";
 
 async function fixture(scriptDelay = "", paused = false) {
   const dir = Zotero.getTempDirectory();
@@ -1024,7 +1025,9 @@ describe("MinerU shared task service and local HTTP API", function () {
   });
 
   for (const fault of ["copy", "hash", "read"] as const) {
-    it(`pauses the real queue on shared configuration ${fault} failure until repair and explicit resume`, async function () {
+    const title = `pauses the real queue on shared configuration ${fault} failure until repair and explicit resume`;
+
+    it(title, async function () {
       const f = await fixture("", true);
       const copy = IOUtils.copy,
         hash = IOUtils.computeHexDigest,
@@ -1416,6 +1419,10 @@ describe("MinerU shared task service and local HTTP API", function () {
     it(title, async function () {
       const f = await fixture("", true);
       const original = IOUtils.writeUTF8;
+      const remove = IOUtils.remove;
+      let completion: PublicationCompletion | undefined;
+      let committed: Zotero.Item | undefined;
+      const removed: string[] = [];
       let recovered: MineruTaskService | undefined;
       try {
         const first = await f.service.submit({
@@ -1428,12 +1435,59 @@ describe("MinerU shared task service and local HTTP API", function () {
           source: f.sourceID,
         });
         const path = PathUtils.join(f.storageRoot, "queue.json");
+        const journalRoot = PathUtils.join(
+          Zotero.DataDirectory.dir,
+          "mineru-publication-journal",
+        );
+        // Observe the real filesystem deletion, not a fake internal ACK. The
+        // queue snapshot must already contain the exact owner receipt on disk.
+        IOUtils.remove = async (target, ...args) => {
+          if (
+            PathUtils.parent(target) === journalRoot &&
+            target.endsWith(".json")
+          ) {
+            const journal = JSON.parse(await IOUtils.readUTF8(target));
+            assert.equal(journal.owner.taskID, first.taskID);
+            const durable = JSON.parse(
+              await IOUtils.readUTF8(path),
+            ).entries.find(
+              (entry: any) => entry.record.taskID === first.taskID,
+            );
+            assert.deepEqual(
+              durable.completion,
+              {
+                ...journal.owner,
+                token: journal.token,
+                result: {
+                  libraryID: journal.identity.libraryID,
+                  itemKey: journal.identity.key,
+                },
+              },
+              "journal deletion follows the real service's flushed exact completion",
+            );
+            assert.deepEqual(durable.completion, completion);
+            removed.push(journal.token);
+          }
+          return remove.call(IOUtils, target, ...args);
+        };
         IOUtils.writeUTF8 = async (target, content, ...args) => {
           if (target === path) {
             const state = JSON.parse(content);
             const entry = state.entries.find(
               (entry: any) => entry.record.taskID === first.taskID,
             );
+            if (entry.completion) {
+              completion ??= entry.completion;
+              assert.deepEqual(entry.completion, completion);
+              committed = await Zotero.Items.getByLibraryAndKeyAsync(
+                entry.completion.result.libraryID,
+                entry.completion.result.itemKey,
+              );
+              assert.exists(
+                committed,
+                "DB commit precedes the service's durable receipt write",
+              );
+            }
             if (
               window === "receipt"
                 ? !!entry.completion
@@ -1452,6 +1506,48 @@ describe("MinerU shared task service and local HTTP API", function () {
           await Zotero.Promise.delay(10);
         assert.isFalse((await f.service.status()).storageReady);
         assert.equal(f.service.get(second.taskID).state, "queued");
+        assert.exists(completion);
+        assert.exists(committed);
+        assert.isTrue(
+          await committed!.fileExists(),
+          "failed queue flush never rolls back committed output",
+        );
+        assert.isTrue(await f.source.fileExists());
+        const journalPath = PathUtils.join(
+          journalRoot,
+          `${completion!.token}.json`,
+        );
+        const durable = JSON.parse(await IOUtils.readUTF8(path)).entries.find(
+          (entry: any) => entry.record.taskID === first.taskID,
+        );
+        assert.equal(completion!.taskID, first.taskID);
+        assert.equal(completion!.attemptID, durable.attemptID);
+        assert.deepEqual(completion!.result, {
+          libraryID: committed!.libraryID,
+          itemKey: committed!.key,
+        });
+        assert.equal(await IOUtils.exists(journalPath), window === "receipt");
+        if (window === "receipt") {
+          assert.isUndefined(
+            durable.completion,
+            "failed receipt flush is not durable evidence",
+          );
+          const journal = JSON.parse(await IOUtils.readUTF8(journalPath));
+          assert.equal(journal.version, 2);
+          assert.equal(journal.phase, "committed");
+          assert.deepEqual(journal.owner, {
+            taskID: first.taskID,
+            attemptID: completion!.attemptID,
+          });
+          assert.equal(journal.token, completion!.token);
+          assert.isEmpty(
+            removed,
+            "unacknowledged output retains its correlated journal",
+          );
+        } else {
+          assert.deepEqual(durable.completion, completion);
+          assert.deepEqual(removed, [completion!.token]);
+        }
         IOUtils.writeUTF8 = original;
         try {
           await f.service.shutdown();
@@ -1462,6 +1558,16 @@ describe("MinerU shared task service and local HTTP API", function () {
         recovered = new MineruTaskService({ storageRoot: f.storageRoot });
         await recovered.initialize();
         assert.equal(recovered.get(first.taskID).state, "succeeded");
+        assert.equal(
+          recovered.get(first.taskID).result!.itemKey,
+          committed!.key,
+        );
+        assert.isFalse(await IOUtils.exists(journalPath));
+        assert.deepEqual(removed, [completion!.token]);
+        const reconciled = JSON.parse(
+          await IOUtils.readUTF8(path),
+        ).entries.find((entry: any) => entry.record.taskID === first.taskID);
+        assert.deepEqual(reconciled.completion, completion);
         assert.isTrue(recovered.getQueue().paused);
         assert.equal(recovered.get(second.taskID).state, "queued");
         assert.equal(
@@ -1472,6 +1578,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         assert.lengthOf((await recovered.results(f.sourceID)).results, 1);
       } finally {
         IOUtils.writeUTF8 = original;
+        IOUtils.remove = remove;
         await recovered?.shutdown();
         await f.clean();
       }
