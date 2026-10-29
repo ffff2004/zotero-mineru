@@ -20,6 +20,8 @@ export ZOTERO_MINERU_API_BASE=http://127.0.0.1:23119/mineru/v2
 
 Change the port or prefix if the installed plugin uses a custom configuration.
 The helper requires v2; an explicit v1 base reports `upgrade_required`.
+For endpoint schemas, response fields and error codes, see the
+[local API protocol](https://github.com/ffff2004/zotero-mineru/blob/main/docs/local-api.md).
 
 ## Read a paper
 

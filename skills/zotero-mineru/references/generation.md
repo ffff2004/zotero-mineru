@@ -162,5 +162,4 @@ Do not interpret empty/partial batch history as total success.
 Generation is complete when the task is `succeeded`, the plugin returns the
 published result attachment identity/paths, and the Markdown is readable. Report
 a terminal error's exact code/message. A standalone CLI ZIP is not a published
-Zotero result. For the transport contract, see the repository's
-[local API protocol](https://github.com/ffff2004/zotero-mineru/blob/main/docs/local-api.md).
+Zotero result.
