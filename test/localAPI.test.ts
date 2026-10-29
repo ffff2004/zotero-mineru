@@ -1514,6 +1514,209 @@ describe("MinerU shared task service and local HTTP API", function () {
     });
   }
 
+  it("blocks dispatch on owned verification ZIP cleanup failure and recovers it before resuming without deleting source or results", async function () {
+    const f = await fixture("", true);
+    const remove = IOUtils.remove;
+    const root = PathUtils.join(
+      Zotero.DataDirectory.dir,
+      "mineru-publication-journal",
+    );
+    const owned = new Set<string>();
+    let recovered: MineruTaskService | undefined;
+    try {
+      const prior = await f.service.submit({
+        requestID: "prior-result",
+        source: f.sourceID,
+      });
+      await f.service.resume();
+      const published = await terminal(f.service, prior.taskID);
+      assert.equal(published.state, "succeeded");
+      await f.service.pause();
+      const first = await f.service.submit({
+        requestID: "verification-cleanup-fault",
+        source: f.sourceID,
+        force: true,
+      });
+      const next = await f.service.submit({
+        requestID: "verification-next",
+        source: f.sourceID,
+        force: true,
+      });
+      IOUtils.remove = async (path, ...args) => {
+        if (PathUtils.parent(path) === root && path.endsWith(".zip")) {
+          owned.add(path);
+          throw new Error("external verification archive removal fault");
+        }
+        return remove.call(IOUtils, path, ...args);
+      };
+      await f.service.resume();
+      const failed = await terminal(f.service, first.taskID);
+      assert.equal(failed.state, "failed");
+      assert.equal(failed.error!.category, "recovery");
+      assert.isTrue(f.service.getQueue().paused);
+      assert.isFalse((await f.service.status()).recoveryReady);
+      assert.equal(f.service.get(next.taskID).state, "queued");
+      const journals = (await IOUtils.getChildren(root)).filter((path) =>
+        path.endsWith(".json"),
+      );
+      assert.lengthOf(journals, 1, "cleanup failure retains recovery evidence");
+      const journal = JSON.parse(await IOUtils.readUTF8(journals[0]));
+      assert.equal(journal.owner.taskID, first.taskID);
+      const archive = PathUtils.join(root, `${journal.token}.zip`);
+      assert.isTrue(owned.has(archive));
+      assert.isTrue(await IOUtils.exists(archive));
+      assert.isTrue(
+        await IOUtils.exists(
+          PathUtils.join(
+            Zotero.getStorageDirectory().path,
+            `tmp-mineru-${journal.token}`,
+          ),
+        ),
+      );
+      IOUtils.remove = remove;
+      await f.service.shutdown();
+      // A crash can also leave an archive without its JSON journal.
+      const orphan = PathUtils.join(root, `${crypto.randomUUID()}.zip`);
+      owned.add(orphan);
+      await IOUtils.copy(PathUtils.join(f.dir.path, "result.zip"), orphan);
+      recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+      await recovered.initialize();
+      for (const path of owned) assert.isFalse(await IOUtils.exists(path));
+      assert.isFalse(await IOUtils.exists(journals[0]));
+      assert.isTrue((await recovered.status()).recoveryReady);
+      assert.isTrue(recovered.getQueue().paused);
+      assert.equal(recovered.get(next.taskID).state, "queued");
+      assert.equal(
+        recovered.get(first.taskID).state,
+        "failed",
+        "recovery never retries the failed task",
+      );
+      assert.isTrue(await f.source.fileExists());
+      assert.equal(
+        (await recovered.results(f.sourceID)).results.find(
+          (item) => item.itemKey === published.result!.itemKey,
+        )!.availability,
+        "valid",
+      );
+      await recovered.resume();
+      assert.equal((await terminal(recovered, next.taskID)).state, "succeeded");
+      assert.equal(
+        (await IOUtils.readUTF8(PathUtils.join(f.dir.path, "calls")))
+          .trim()
+          .split("\n").length,
+        3,
+      );
+    } finally {
+      IOUtils.remove = remove;
+      await recovered?.shutdown();
+      await f.service.shutdown();
+      // Failure cleanup only touches exact archives observed at the external seam.
+      for (const path of owned) {
+        assert.equal(PathUtils.parent(path), root);
+        await remove.call(IOUtils, path, { ignoreAbsent: true });
+      }
+      // A failed assertion must not strand the real journal for later test modules.
+      if (!recovered && !(await f.service.status()).recoveryReady) {
+        recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+        await recovered.initialize();
+        await recovered.shutdown();
+      }
+      await f.clean();
+    }
+  });
+
+  it("fails startup closed on orphan verification ZIP cleanup errors and leaves unrecognized files untouched", async function () {
+    const f = await fixture("", true);
+    await f.service.shutdown();
+    const root = PathUtils.join(
+      Zotero.DataDirectory.dir,
+      "mineru-publication-journal",
+    );
+    await IOUtils.makeDirectory(root, { ignoreExisting: true });
+    const orphan = PathUtils.join(root, `${crypto.randomUUID()}.zip`);
+    const unknown = PathUtils.join(root, "user-original.zip");
+    const unsupported = PathUtils.join(root, `${"-".repeat(36)}.zip`);
+    const remove = IOUtils.remove;
+    let starting = new MineruTaskService({ storageRoot: f.storageRoot });
+    try {
+      await IOUtils.copy(PathUtils.join(f.dir.path, "result.zip"), orphan);
+      await IOUtils.writeUTF8(unknown, "user archive");
+      await IOUtils.writeUTF8(unsupported, "unsupported token");
+      IOUtils.remove = async (path, ...args) => {
+        if (path === orphan)
+          throw new Error("external orphan archive removal fault");
+        return remove.call(IOUtils, path, ...args);
+      };
+      try {
+        await starting.initialize();
+        assert.fail("orphan cleanup must block readiness");
+      } catch (error) {
+        assert.match(String(error), /Publication recovery incomplete/);
+      }
+      assert.isFalse((await starting.status()).recoveryReady);
+      assert.isTrue(await IOUtils.exists(orphan));
+      try {
+        await starting.resume();
+        assert.fail("cleanup uncertainty blocks dispatch");
+      } catch (error) {
+        assert.equal((error as MineruAPIError).code, "recovery_required");
+      }
+      await starting
+        .shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      IOUtils.remove = remove;
+      starting = new MineruTaskService({ storageRoot: f.storageRoot });
+      await starting.initialize();
+      assert.isFalse(await IOUtils.exists(orphan));
+      assert.equal(await IOUtils.readUTF8(unknown), "user archive");
+      assert.equal(await IOUtils.readUTF8(unsupported), "unsupported token");
+      assert.isTrue(await f.source.fileExists());
+    } finally {
+      IOUtils.remove = remove;
+      await starting
+        .shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      for (const path of [orphan, unknown, unsupported]) {
+        assert.equal(PathUtils.parent(path), root);
+        await remove.call(IOUtils, path, { ignoreAbsent: true });
+      }
+      await f.clean();
+    }
+  });
+
+  it("refuses an escaped verification archive path from the filesystem without touching the external file", async function () {
+    const f = await fixture("", true);
+    await f.service.shutdown();
+    const root = PathUtils.join(
+      Zotero.DataDirectory.dir,
+      "mineru-publication-journal",
+    );
+    await IOUtils.makeDirectory(root, { ignoreExisting: true });
+    const external = PathUtils.join(f.dir.path, `${crypto.randomUUID()}.zip`);
+    await IOUtils.writeUTF8(external, "not plugin owned");
+    const children = IOUtils.getChildren;
+    const starting = new MineruTaskService({ storageRoot: f.storageRoot });
+    try {
+      IOUtils.getChildren = async (path, ...args) =>
+        path === root ? [external] : children.call(IOUtils, path, ...args);
+      try {
+        await starting.initialize();
+        assert.fail("escaped cleanup path must block recovery");
+      } catch (error) {
+        assert.match(String(error), /Publication recovery incomplete/);
+      }
+      assert.isFalse((await starting.status()).recoveryReady);
+      assert.equal(await IOUtils.readUTF8(external), "not plugin owned");
+      assert.isTrue(await f.source.fileExists());
+    } finally {
+      IOUtils.getChildren = children;
+      await starting
+        .shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      await f.clean();
+    }
+  });
+
   it("pauses on sensitive cleanup failure, retains committed success, and retries owned orphan cleanup at startup", async function () {
     const f = await fixture("", true);
     const original = IOUtils.remove;

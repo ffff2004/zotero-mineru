@@ -3,6 +3,7 @@
 const MAIN_FILE = "markdown.md";
 const SENTINEL = "zotero-mineru-generation:v1";
 const JOURNAL_DIR = "mineru-publication-journal";
+const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 type FileRecord = { path: string; size: number; sha256: string };
 type PackageRecord = { files: FileRecord[]; directories: string[] };
@@ -86,6 +87,51 @@ function journalPath(token: string): string {
   return pathFor(journalDirectory(), `${token}.json`);
 }
 
+/** Never follow a redirected private root or a token-shaped symlink/special file. */
+function verifiedJournalDirectory(): string {
+  const path = journalDirectory();
+  const root = Zotero.File.pathToFile(path);
+  if (!PathUtils.isAbsolute(path) || root.isSymlink() || !root.isDirectory())
+    throw new Error("Unsafe publication journal directory");
+  const resolved = root.clone();
+  resolved.normalize();
+  if (resolved.path !== path)
+    throw new Error(
+      "Publication journal directory is not its resolved owned root",
+    );
+  return path;
+}
+
+function verificationPath(token: string): string {
+  if (!TOKEN.test(token))
+    throw new Error("Unsupported verification archive token");
+  const path = pathFor(verifiedJournalDirectory(), `${token}.zip`);
+  const file = Zotero.File.pathToFile(path);
+  let symlink = false;
+  try {
+    symlink = file.isSymlink();
+  } catch (error) {
+    if (
+      (error as { result?: number }).result !==
+      Components.results.NS_ERROR_FILE_NOT_FOUND
+    )
+      throw error;
+  }
+  if (symlink || (file.exists() && !file.isFile()))
+    throw new Error("Unsafe publication verification archive");
+  if (file.exists()) {
+    const resolved = file.clone();
+    resolved.normalize();
+    if (resolved.path !== path)
+      throw new Error("Verification archive escapes its resolved owned root");
+  }
+  return path;
+}
+
+async function removeVerification(token: string): Promise<void> {
+  await IOUtils.remove(verificationPath(token), { ignoreAbsent: true });
+}
+
 function storageDirectory(): string {
   return Zotero.getStorageDirectory().path;
 }
@@ -104,6 +150,7 @@ async function saveJournal(journal: Journal): Promise<void> {
     ignoreExisting: true,
     permissions: 0o700,
   });
+  verifiedJournalDirectory();
   const path = journalPath(journal.token);
   await IOUtils.writeUTF8(path, JSON.stringify(journal), {
     tmpPath: `${path}.tmp`,
@@ -112,6 +159,8 @@ async function saveJournal(journal: Journal): Promise<void> {
 }
 
 async function removeJournal(journal: Journal): Promise<void> {
+  // Retain recovery evidence until every sensitive verification archive is gone.
+  await removeVerification(journal.token);
   await IOUtils.remove(journalPath(journal.token), { ignoreAbsent: true });
 }
 
@@ -225,7 +274,7 @@ async function assertZipContents(
   record: PackageRecord,
   token: string,
 ): Promise<void> {
-  const zipPath = pathFor(journalDirectory(), `${token}.zip`);
+  const zipPath = verificationPath(token);
   try {
     if ((await Zotero.File.zipDirectory(root, zipPath, null)) === false) {
       throw new Error("Zotero could not create the attachment upload ZIP");
@@ -252,7 +301,7 @@ async function assertZipContents(
       reader.close();
     }
   } finally {
-    await IOUtils.remove(zipPath, { ignoreAbsent: true });
+    await removeVerification(token);
   }
 }
 
@@ -375,6 +424,8 @@ async function recoverOne(
   journal: Journal,
   acknowledgeCompletion?: AcknowledgeCompletion,
 ): Promise<"committed" | "rolledBack"> {
+  // Cleanup failure must retain the journal, even before an item was created.
+  await removeVerification(journal.token);
   const identity = journal.identity;
   const acknowledge = async () => {
     if (journal.version !== 2) return;
@@ -503,8 +554,23 @@ export async function recoverIncompletePublications(
   const failures: Error[] = [];
   try {
     if (!(await IOUtils.exists(journalDirectory()))) return result;
-    for (const path of await IOUtils.getChildren(journalDirectory())) {
-      if (!/^[0-9a-f-]{36}\.json$/.test(PathUtils.filename(path))) continue;
+    const root = verifiedJournalDirectory();
+    for (const path of await IOUtils.getChildren(root)) {
+      const name = PathUtils.filename(path);
+      if (name.endsWith(".zip") && TOKEN.test(name.slice(0, -4))) {
+        try {
+          const token = name.slice(0, -4);
+          if (path !== verificationPath(token))
+            throw new Error("Unexpected verification archive cleanup path");
+          await removeVerification(token);
+        } catch (error) {
+          failures.push(
+            new Error(`Could not clean verification archive: ${String(error)}`),
+          );
+        }
+        continue;
+      }
+      if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
       try {
         const journal = JSON.parse(await IOUtils.readUTF8(path)) as Journal;
         if (

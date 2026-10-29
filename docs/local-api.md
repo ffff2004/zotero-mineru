@@ -179,7 +179,12 @@ can have expired members and explicitly report partial history. Unknown or
 evicted IDs return `task_not_found`/`batch_not_found`.
 
 Copied PDF/configuration and parse/export scratch are removed on settled
-execution. Raw stdout/stderr remain separately in task-owned private diagnostic
+execution. Full-bundle verification ZIPs in the private publication-journal root
+are also sensitive scratch: supported UUID-named archives (including crash
+orphans without JSON) are cleaned before startup recovery is ready. Cleanup
+failure retains available journal evidence and blocks dispatch; redirected roots,
+symlinks and non-file archive paths are refused, and unrecognized files are left
+untouched. Raw stdout/stderr remain separately in task-owned private diagnostic
 files until history eviction. **Raw CLI logs may contain secrets**; they are not
 redacted and are never returned through task JSON/HTTP. Queue snapshots persist
 no configuration content, environment values, logs or Zotero objects.
