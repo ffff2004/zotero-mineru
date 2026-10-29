@@ -28,6 +28,7 @@ queue-state-cancelled = Cancelled
 queue-state-interrupted = Interrupted
 queue-action-failed = Queue operation failed
 queue-result-unavailable = The result attachment is no longer available.
+queue-source-unavailable = The source PDF is no longer available.
 queue-batch-submitted = Submitted { $count } tasks. Invalid entries are listed below; they were not queued.
 queue-full = No tasks accepted: { $required } new slots required, { $remaining } available.
 queue-limit-invalid = Enter an integer from 1 to 2147483647 (Zotero's integer preference range). Invalid input is not saved.

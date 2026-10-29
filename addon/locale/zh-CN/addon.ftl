@@ -28,6 +28,7 @@ queue-state-cancelled = 已取消
 queue-state-interrupted = 已中断
 queue-action-failed = 队列操作失败
 queue-result-unavailable = 结果附件已不可用。
+queue-source-unavailable = 源 PDF 已不可用。
 queue-batch-submitted = 已提交 { $count } 个任务。以下无效项未入队。
 queue-full = 未接收任务：需要 { $required } 个新空位，剩余 { $remaining } 个。
 queue-limit-invalid = 请输入 1–2147483647 的整数（Zotero 整数偏好设置支持的范围）。无效值不会保存。

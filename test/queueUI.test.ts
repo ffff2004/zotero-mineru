@@ -75,12 +75,130 @@ describe("MinerU queue window", function () {
     assert.isBelow(response.status, 300, response.responseText);
     return JSON.parse(response.responseText);
   };
-  const submit = async () =>
+  const submit = async (pdf = source) =>
     service.submit({
       requestID: crypto.randomUUID(),
-      source: { libraryID: source.libraryID, itemKey: source.key },
+      source: { libraryID: pdf.libraryID, itemKey: pdf.key },
       force: true,
     });
+  const importPDF = (parentItemID?: number) =>
+    Zotero.Attachments.importFromFile({
+      file: Zotero.File.pathToFile(PathUtils.join(dir.path, "paper.pdf")),
+      parentItemID,
+      title: "Full text PDF",
+      contentType: "application/pdf",
+    });
+  const openQueueFor = async (taskID: string) => {
+    command("queue");
+    await waitFor(
+      () =>
+        !!findQueue()?.document.getElementById(taskButton(taskID, "source")),
+      "queued PDF has a source link",
+    );
+    queue = findQueue()!;
+  };
+  const sourceLink = (taskID: string) =>
+    queue!.document.getElementById(
+      taskButton(taskID, "source"),
+    ) as HTMLAnchorElement;
+  const assertSource = (
+    taskID: string,
+    pdf: Pick<Zotero.Item, "libraryID" | "key">,
+    title: string,
+  ) => {
+    const label = queue!.document.getElementById(taskButton(taskID, "label"))!;
+    const link = sourceLink(taskID);
+    assert.equal(label.localName, "p");
+    assert.equal(link.localName, "a");
+    assert.strictEqual(link.parentElement, label);
+    assert.equal(link.textContent, `${title} — ${pdf.libraryID}/${pdf.key}`);
+    assert.equal(
+      link.getAttribute("href"),
+      `zotero://open-pdf/library/items/${pdf.key}`,
+      "source URI targets the exact attachment, not its parent or a sibling",
+    );
+  };
+  const withReaderSpy = async (check: (opened: number[]) => Promise<void>) => {
+    const originalOpen = Zotero.Reader.open;
+    const opened: number[] = [];
+    // The fixture is intentionally not a readable PDF; only replace the
+    // external reader boundary, not source lookup or filesystem validation.
+    Zotero.Reader.open = async (itemID) => {
+      opened.push(itemID);
+    };
+    try {
+      await check(opened);
+    } finally {
+      Zotero.Reader.open = originalOpen;
+    }
+  };
+
+  const unavailableSource = async (
+    unavailable: "deleted" | "missing file" | "erased",
+  ) => {
+    const paper = new Zotero.Item("journalArticle");
+    paper.setField("title", "Unavailable queue source");
+    await paper.saveTx();
+    try {
+      const sibling = await importPDF(paper.id);
+      const pdf = await importPDF(paper.id);
+      const task = await submit(pdf);
+      await openQueueFor(task.taskID);
+      const originalPath = pdf.attachmentPath;
+      const identity = { id: pdf.id, libraryID: pdf.libraryID, key: pdf.key };
+      if (unavailable === "deleted") {
+        pdf.deleted = true;
+        await pdf.saveTx();
+      } else if (unavailable === "missing file") {
+        const path = await pdf.getFilePathAsync();
+        assert.equal(
+          path,
+          PathUtils.join(
+            Zotero.Attachments.getStorageDirectory(pdf).path,
+            "paper.pdf",
+          ),
+          "only remove this disposable attachment's imported PDF",
+        );
+        await IOUtils.remove(path as string);
+      } else {
+        await pdf.eraseTx();
+        await waitFor(
+          () =>
+            sourceLink(task.taskID)?.textContent ===
+            `${identity.key} — ${identity.libraryID}/${identity.key}`,
+          "an erased source falls back to its durable item key",
+        );
+        assertSource(task.taskID, identity, identity.key);
+      }
+      await withReaderSpy(async (opened) => {
+        sourceLink(task.taskID).click();
+        // Assert the en-US user-visible message, not a source-module locale
+        // helper whose addon global belongs to a different test sandbox.
+        const localized = "The source PDF is no longer available.";
+        await waitFor(
+          () =>
+            !!queue!.document
+              .getElementById("mineru-queue-error")!
+              .textContent?.includes(localized),
+          "missing source is reported in the queue's visible error region",
+        );
+        assert.isEmpty(opened, "never opens the missing PDF or its sibling");
+        assert.equal(service.getTask(task.taskID).source.itemKey, identity.key);
+        assert.equal(service.getTask(task.taskID).state, "queued");
+        assert.isTrue(await sibling.fileExists());
+        if (unavailable !== "erased") {
+          const unchanged = await Zotero.Items.getByLibraryAndKeyAsync(
+            pdf.libraryID,
+            pdf.key,
+          );
+          assert.equal(unchanged.id, pdf.id);
+          assert.equal(unchanged.attachmentPath, originalPath);
+        }
+      });
+    } finally {
+      await paper.eraseTx();
+    }
+  };
 
   before(async function () {
     main = Zotero.getMainWindow();
@@ -262,6 +380,80 @@ describe("MinerU queue window", function () {
     } finally {
       Services.obs.removeObserver(observer, "select-dialog-loaded");
     }
+  });
+
+  it("labels a child PDF with its bibliographic parent title and opens that exact attachment after row replacement", async function () {
+    const paper = new Zotero.Item("journalArticle");
+    paper.setField("title", "Queue source <paper> & citation");
+    await paper.saveTx();
+    try {
+      const sibling = await importPDF(paper.id);
+      const pdf = await importPDF(paper.id);
+      const task = await submit(pdf);
+      await openQueueFor(task.taskID);
+      assertSource(task.taskID, pdf, "Queue source <paper> & citation");
+      assert.notEqual(pdf.id, sibling.id);
+      assert.isNull(sourceLink(task.taskID).querySelector("paper"));
+      await withReaderSpy(async (opened) => {
+        const originalLink = sourceLink(task.taskID);
+        originalLink.click();
+        await waitFor(() => opened.length === 1);
+        assert.deepEqual(opened, [pdf.id]);
+        await waitFor(() => sourceLink(task.taskID) !== originalLink);
+        sourceLink(task.taskID).click();
+        await waitFor(() => opened.length === 2);
+        assert.deepEqual(opened, [pdf.id, pdf.id]);
+      });
+    } finally {
+      await paper.eraseTx();
+    }
+  });
+
+  it("falls back to a standalone attachment title and then its filename", async function () {
+    const pdf = await importPDF();
+    try {
+      pdf.setField("title", "Standalone source title");
+      await pdf.saveTx();
+      const task = await submit(pdf);
+      await openQueueFor(task.taskID);
+      assertSource(task.taskID, pdf, "Standalone source title");
+      pdf.setField("title", "");
+      await pdf.saveTx();
+      await waitFor(
+        () =>
+          sourceLink(task.taskID)?.textContent ===
+          `paper.pdf — ${pdf.libraryID}/${pdf.key}`,
+        "an empty attachment title falls back to the actual filename",
+      );
+      assertSource(task.taskID, pdf, "paper.pdf");
+    } finally {
+      await pdf.eraseTx();
+    }
+  });
+
+  it("uses the attachment title when its bibliographic parent title is empty", async function () {
+    const paper = new Zotero.Item("journalArticle");
+    await paper.saveTx();
+    try {
+      const pdf = await importPDF(paper.id);
+      const task = await submit(pdf);
+      await openQueueFor(task.taskID);
+      assertSource(task.taskID, pdf, "Full text PDF");
+    } finally {
+      await paper.eraseTx();
+    }
+  });
+
+  it("reports a localized error for a deleted PDF without opening or replacing it", async function () {
+    await unavailableSource("deleted");
+  });
+
+  it("reports a localized error for a missing-file PDF without opening or replacing it", async function () {
+    await unavailableSource("missing file");
+  });
+
+  it("falls back to an erased PDF key and reports an error without opening its sibling", async function () {
+    await unavailableSource("erased");
   });
 
   it("opens with no selection, shares HTTP/menu order, exposes atomic batch errors and stale moves, detaches its interval", async function () {

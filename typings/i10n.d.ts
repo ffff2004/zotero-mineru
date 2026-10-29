@@ -65,6 +65,7 @@ export type FluentMessageId =
   | 'queue-recent'
   | 'queue-result-unavailable'
   | 'queue-resume'
+  | 'queue-source-unavailable'
   | 'queue-state-cancel_requested'
   | 'queue-state-cancelled'
   | 'queue-state-failed'

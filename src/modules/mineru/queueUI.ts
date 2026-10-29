@@ -115,9 +115,11 @@ export function openQueueWindow(): Window {
         // One delegated listener; replacing rows leaves no retained per-task handlers.
         const actions = new Map<string, () => unknown | Promise<unknown>>();
         const click = (event: Event) => {
-          const target = (event.target as Element).closest("button");
-          if (target && actions.has(target.id))
+          const target = (event.target as Element).closest("button, a");
+          if (target && actions.has(target.id)) {
+            event.preventDefault();
             void action(actions.get(target.id)!);
+          }
         };
         root.addEventListener("click", click);
         detach.push(() => {
@@ -148,13 +150,38 @@ export function openQueueWindow(): Window {
           node.dataset.state = task.state;
           node.style.cssText = "padding:8px;overflow-wrap:anywhere";
           const state = getString(`queue-state-${task.state}`);
-          node.append(
-            element(
-              "p",
-              `${node.id}-label`,
-              `${titles.get(task.taskID) || task.source.itemKey} — ${task.source.libraryID}/${task.source.itemKey} — ${state} — ${task.phase} — ${task.taskID}`,
-            ),
+          const label = element("p", `${node.id}-label`);
+          const sourceLink = element(
+            "a",
+            `${node.id}-source`,
+            `${titles.get(task.taskID) || task.source.itemKey} — ${task.source.libraryID}/${task.source.itemKey}`,
+          ) as HTMLAnchorElement;
+          const libraryPath =
+            task.source.libraryID === Zotero.Libraries.userLibraryID
+              ? "library"
+              : `groups/${Zotero.Groups.getGroupIDFromLibraryID(task.source.libraryID)}`;
+          sourceLink.href = `zotero://open-pdf/${libraryPath}/items/${task.source.itemKey}`;
+          actions.set(sourceLink.id, async () => {
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(
+              task.source.libraryID,
+              task.source.itemKey,
+            );
+            if (disposed) return;
+            if (
+              !item ||
+              item.deleted ||
+              !item.isPDFAttachment() ||
+              !(await item.getFilePathAsync())
+            )
+              throw new Error(getString("queue-source-unavailable"));
+            if (disposed) return;
+            await Zotero.Reader.open(item.id);
+          });
+          label.append(
+            sourceLink,
+            doc.createTextNode(` — ${state} — ${task.phase} — ${task.taskID}`),
           );
+          node.append(label);
           if (task.error)
             node.append(
               element(
@@ -202,11 +229,16 @@ export function openQueueWindow(): Window {
                   task.source.libraryID,
                   task.source.itemKey,
                 );
+                const parent =
+                  item && item.parentID && !item.deleted
+                    ? await Zotero.Items.getAsync(item.parentID)
+                    : undefined;
                 return [
                   task.taskID,
                   String(
-                    (item &&
-                      (item.getField("title") || item.attachmentFilename)) ||
+                    (parent && !parent.deleted && parent.getField("title")) ||
+                      (item &&
+                        (item.getField("title") || item.attachmentFilename)) ||
                       task.source.itemKey,
                   ),
                 ] as const;
