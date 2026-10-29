@@ -9,7 +9,7 @@ reuse and publishes Markdown, middle JSON, assets and provenance together.
 ## Submit and leave
 
 ```bash
-uv run --no-project python <skill-dir>/scripts/mineru.py --out result.json ensure --library-id 1 --item-key PDFKEY01 --request-id UNIQUE-OPERATION-ID --detach
+uv run <skill-dir>/scripts/mineru.py --out result.json ensure --library-id 1 --item-key PDFKEY01 --request-id UNIQUE-OPERATION-ID --detach
 ```
 
 Use a fresh request ID for a new operation. `ensure` generates one when omitted;
@@ -75,10 +75,10 @@ automatically retries a dropped request or polls by resubmitting it.
 ## Query, wait and outcomes
 
 ```bash
-uv run --no-project python <skill-dir>/scripts/mineru.py task --task-id TASK-ID
-uv run --no-project python <skill-dir>/scripts/mineru.py batch --batch-id BATCH-ID
-uv run --no-project python <skill-dir>/scripts/mineru.py --out result.json wait --task-id TASK-ID --timeout 60
-uv run --no-project python <skill-dir>/scripts/mineru.py wait --batch-id BATCH-ID --timeout 60
+uv run <skill-dir>/scripts/mineru.py task --task-id TASK-ID
+uv run <skill-dir>/scripts/mineru.py batch --batch-id BATCH-ID
+uv run <skill-dir>/scripts/mineru.py --out result.json wait --task-id TASK-ID --timeout 60
+uv run <skill-dir>/scripts/mineru.py wait --batch-id BATCH-ID --timeout 60
 ```
 
 `queued`, `running`, `cancel_requested` are nonterminal. `succeeded`, `failed`,
@@ -114,13 +114,13 @@ Fresh and restarted queues stay **paused** until explicitly resumed. Submitting
 never resumes them. Queue changes affect menu/API/other clients alike:
 
 ```bash
-uv run --no-project python <skill-dir>/scripts/mineru.py queue
-uv run --no-project python <skill-dir>/scripts/mineru.py resume
-uv run --no-project python <skill-dir>/scripts/mineru.py pause
-uv run --no-project python <skill-dir>/scripts/mineru.py move --task-id TASK-ID --before OTHER-TASK-ID
-uv run --no-project python <skill-dir>/scripts/mineru.py move --task-id TASK-ID --after OTHER-TASK-ID
-uv run --no-project python <skill-dir>/scripts/mineru.py cancel --task-id TASK-ID
-uv run --no-project python <skill-dir>/scripts/mineru.py cancel --batch-id BATCH-ID
+uv run <skill-dir>/scripts/mineru.py queue
+uv run <skill-dir>/scripts/mineru.py resume
+uv run <skill-dir>/scripts/mineru.py pause
+uv run <skill-dir>/scripts/mineru.py move --task-id TASK-ID --before OTHER-TASK-ID
+uv run <skill-dir>/scripts/mineru.py move --task-id TASK-ID --after OTHER-TASK-ID
+uv run <skill-dir>/scripts/mineru.py cancel --task-id TASK-ID
+uv run <skill-dir>/scripts/mineru.py cancel --batch-id BATCH-ID
 ```
 
 Pause stops subsequent dispatch, not the active task. Moves require both tasks

@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pymupdf>=1.24"]
+# ///
 """Find published MinerU results and trace their blocks to the original PDF."""
 
 import argparse
@@ -588,7 +592,7 @@ def render(bundle, pdf, candidate, out, dpi=144, padding=0.01):
     except ImportError as exc:
         raise Failure(
             "renderer_missing",
-            "Run render with uv run --no-project --with pymupdf python",
+            "Run render with uv run <skill-dir>/scripts/mineru.py render",
         ) from exc
     files, source = bundle_files(bundle)
     provenance = read_json(files["provenance"])

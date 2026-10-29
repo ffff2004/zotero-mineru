@@ -7,7 +7,8 @@ description: Read Zotero MinerU Markdown, generate missing results through the i
 
 Use the installed Zotero MinerU plugin to obtain published Markdown and verify
 parsed content against the source PDF. Run the helper with
-`uv run --no-project python <skill-dir>/scripts/mineru.py`. Commands emit JSON;
+`uv run <skill-dir>/scripts/mineru.py`. uv manages the script's Python and
+PyMuPDF dependency in an isolated environment. Commands emit JSON;
 use `--help` for arguments. The helper discovers the API prefix from this
 repository's `package.json`; for a detached skill copy set
 `ZOTERO_MINERU_API_BASE` to the installed plugin's loopback API URL.
