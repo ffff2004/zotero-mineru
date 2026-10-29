@@ -323,6 +323,9 @@ export class MineruTaskService {
   private loaded = false;
   private alive = true;
   private dispatching = false;
+  private worker?: Promise<void>;
+  private stopping?: Promise<void>;
+  private cleanupFailure?: unknown;
   private activeID?: string;
   private initialization?: Promise<void>;
   private views = new Map<string, TaskView>();
@@ -332,6 +335,8 @@ export class MineruTaskService {
 
   /** Load durable state, recover publication first, reconcile exact owners, stay paused. */
   initialize(): Promise<void> {
+    if (!this.alive)
+      return Promise.reject(new Error("MinerU plugin has stopped"));
     return (this.initialization ??= this.startup());
   }
   private async startup(): Promise<void> {
@@ -431,7 +436,10 @@ export class MineruTaskService {
       );
     return entry;
   }
-  private mutate<T>(change: (candidate: State) => T | Promise<T>): Promise<T> {
+  private mutate<T>(
+    change: (candidate: State) => T | Promise<T>,
+    publicMutation = false,
+  ): Promise<T> {
     const operation = this.gate.then(async () => {
       if (!this.storageReady || !this.storage)
         throw new MineruAPIError(
@@ -439,8 +447,10 @@ export class MineruTaskService {
           "queue_storage_unavailable",
           "Queue storage is unavailable",
         );
+      if (publicMutation) this.requireReady();
       const candidate = clone(this.state);
       const result = await change(candidate);
+      if (publicMutation) this.requireReady();
       const evicted = this.prune(candidate);
       candidate.revision++;
       try {
@@ -758,7 +768,7 @@ export class MineruTaskService {
       const source = await this.resolveRequested(requested, false);
       this.capacity(candidate, 1);
       return this.add(candidate, requested, source);
-    });
+    }, true);
     if (report && !terminal(record.state))
       this.reports.set(record.taskID, report);
     this.kick();
@@ -863,7 +873,7 @@ export class MineruTaskService {
       };
       candidate.batches.push(batch);
       return batch.batchID;
-    });
+    }, true);
     this.kick();
     return this.getBatch(batchID);
   }
@@ -871,14 +881,14 @@ export class MineruTaskService {
     this.requireReady();
     await this.mutate((candidate) => {
       candidate.paused = true;
-    });
+    }, true);
     return this.getQueue();
   }
   async resume(): Promise<QueueRecord> {
     this.requireReady();
     await this.mutate((candidate) => {
       candidate.paused = false;
-    });
+    }, true);
     const queue = this.getQueue();
     this.kick();
     return queue;
@@ -917,7 +927,7 @@ export class MineruTaskService {
         0,
         taskID,
       );
-    });
+    }, true);
     return this.getQueue();
   }
   private cancelEntry(candidate: State, taskID: string): boolean {
@@ -936,8 +946,9 @@ export class MineruTaskService {
   }
   async cancel(taskID: string): Promise<TaskRecord> {
     this.requireReady();
-    const signal = await this.mutate((candidate) =>
-      this.cancelEntry(candidate, taskID),
+    const signal = await this.mutate(
+      (candidate) => this.cancelEntry(candidate, taskID),
+      true,
     );
     if (signal && this.activeID === taskID) this.controller.cancel();
     return this.get(taskID);
@@ -959,7 +970,7 @@ export class MineruTaskService {
         if (candidate.entries.some((entry) => entry.record.taskID === id))
           if (this.cancelEntry(candidate, id)) signalID = id;
       return signalID;
-    });
+    }, true);
     if (signalID && this.activeID === signalID) this.controller.cancel();
     return this.getBatch(batchID);
   }
@@ -974,7 +985,8 @@ export class MineruTaskService {
     )
       return;
     this.dispatching = true;
-    void this.dispatch()
+    this.worker = this.dispatch();
+    void this.worker
       .catch(async (error) => {
         this.recoveryReady = false;
         Zotero.logError(error as Error);
@@ -1068,7 +1080,7 @@ export class MineruTaskService {
             finalView = view;
             this.views.set(id, view);
             try {
-              this.reports.get(id)?.(view);
+              if (this.alive) this.reports.get(id)?.(view);
             } catch (error) {
               Zotero.logError(error as Error);
             }
@@ -1106,12 +1118,19 @@ export class MineruTaskService {
           finalView.failureCategory === "cleanup"
         )
           this.recoveryReady = false;
+        if (finalView.failureCategory === "cleanup")
+          this.cleanupFailure = new Error(
+            "MinerU child cleanup could not be confirmed",
+          );
       }
     } catch (error) {
       const category =
         error instanceof MineruTaskError ? error.category : undefined;
       pause = category === "cleanup" || !this.storageReady;
-      if (category === "cleanup") this.recoveryReady = false;
+      if (category === "cleanup") {
+        this.recoveryReady = false;
+        this.cleanupFailure = error;
+      }
       failure = {
         code: error instanceof MineruAPIError ? error.code : "task_failed",
         message:
@@ -1214,10 +1233,32 @@ export class MineruTaskService {
       entry.record.updatedAt = now();
     });
   }
-  shutdown(): void {
+  /** Stop intake immediately; callers must await quiescence before replacing this authority. */
+  shutdown(): Promise<void> {
+    if (this.stopping) return this.stopping;
     this.alive = false;
     this.ready = false;
     this.controller.shutdown();
+    return (this.stopping = this.drain());
+  }
+  private async drain(): Promise<void> {
+    // Never hold the durable gate while waiting for a worker: its ACK and final
+    // transition still need that gate after intake has stopped.
+    const outcomes = await Promise.allSettled([
+      this.initialization,
+      this.worker,
+    ]);
+    await this.gate;
+    this.ready = false;
+    const failures = outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason] : [],
+    );
+    if (this.cleanupFailure) failures.push(this.cleanupFailure);
+    if (failures.length)
+      throw new AggregateError(
+        failures,
+        "MinerU shutdown could not confirm durable cleanup",
+      );
   }
 }
 

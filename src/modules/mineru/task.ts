@@ -156,7 +156,9 @@ export class MineruTaskController {
     let publicationErrorReported = false;
     let scratchDirectory: string | undefined;
     const emit = (record?: PluginLogRecord, extra?: Partial<TaskView>) => {
-      if (this.alive)
+      // A durable owner must observe the actual outcome even while shutdown
+      // suppresses standalone/UI callbacks; its final flush still owns the slot.
+      if (this.alive || lifecycle.owner)
         report({ phase, state, snapshot, logs, configPath, record, ...extra });
     };
     this.reportCancellation = () => {

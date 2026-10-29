@@ -166,10 +166,10 @@ async function onMainWindowUnload(_win: Window): Promise<void> {
   // Menu registration belongs to the plugin instance and is cleared on shutdown.
 }
 
-function onShutdown(): void {
+async function onShutdown(): Promise<void> {
   unregisterAPI?.();
   unregisterAPI = undefined;
-  mineruService.shutdown();
+  await mineruService.shutdown();
   closeQueueWindow();
   closeTaskWindows();
   addon.data.alive = false;

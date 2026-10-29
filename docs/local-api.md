@@ -91,7 +91,12 @@ without affecting the active task. For active work it persists
 remains success. The execution slot covers preparation, child termination/wait,
 both log drains, publication recovery/finalization, sensitive scratch cleanup
 and final durable task transition; terminal progress notifications do not release
-it. Cleanup uncertainty pauses further execution.
+it. Cleanup uncertainty pauses further execution. Plugin shutdown stops intake and
+signals the active child immediately, then awaits initialization, child wait and
+both drains, publication/scratch cleanup, and the final durable mutation before
+instance replacement. Public requests still validating when intake stops are
+rejected; internal completion writes remain allowed. Shutdown rejects if durable
+settlement or child/scratch cleanup cannot be confirmed.
 
 ## Queue management
 

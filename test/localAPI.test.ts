@@ -132,7 +132,12 @@ async function fixture(scriptDelay = "", paused = false) {
           await terminal(service, active);
         }
       }
-      service.shutdown();
+      try {
+        await service.shutdown();
+      } catch (error) {
+        const status = await service.status();
+        if (status.storageReady && status.recoveryReady) throw error;
+      }
       for (const [key, value] of saved) {
         if (value === undefined) Zotero.Prefs.clear(key, true);
         else Zotero.Prefs.set(key, value as string | boolean, true);
@@ -164,6 +169,242 @@ async function terminal(
 
 describe("MinerU shared task service and local HTTP API", function () {
   this.timeout(120000);
+
+  it("awaits shutdown through both real child drains, scratch cleanup and final flush before replacement", async function () {
+    const f = await fixture("printf 'stdout'; printf 'stderr' >&2", true);
+    const write = IOUtils.write;
+    const remove = IOUtils.remove;
+    const writeUTF8 = IOUtils.writeUTF8;
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const out = deferred(),
+      err = deferred(),
+      cleanup = deferred(),
+      flush = deferred();
+    const releaseOut = deferred(),
+      releaseErr = deferred(),
+      releaseCleanup = deferred(),
+      releaseFlush = deferred();
+    let replacement: MineruTaskService | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      const first = await f.service.submit({
+        requestID: "shutdown-active",
+        source: f.sourceID,
+      });
+      const next = await f.service.submit({
+        requestID: "shutdown-pending",
+        source: f.sourceID,
+      });
+      IOUtils.write = async (path, data, ...args) => {
+        if (path.endsWith("stdout.log") && data.byteLength) {
+          out.resolve();
+          await releaseOut.promise;
+        }
+        if (path.endsWith("stderr.log") && data.byteLength) {
+          err.resolve();
+          await releaseErr.promise;
+        }
+        return write.call(IOUtils, path, data, ...args);
+      };
+      IOUtils.remove = async (path, ...args) => {
+        if (
+          path.startsWith(
+            PathUtils.join(f.storageRoot, "scratch", first.taskID),
+          )
+        ) {
+          cleanup.resolve();
+          await releaseCleanup.promise;
+        }
+        return remove.call(IOUtils, path, ...args);
+      };
+      IOUtils.writeUTF8 = async (path, content, ...args) => {
+        if (
+          path === PathUtils.join(f.storageRoot, "queue.json") &&
+          JSON.parse(content).entries.some(
+            (entry: any) =>
+              entry.record.taskID === first.taskID && entry.record.completedAt,
+          )
+        ) {
+          flush.resolve();
+          await releaseFlush.promise;
+        }
+        return writeUTF8.call(IOUtils, path, content, ...args);
+      };
+      await f.service.resume();
+      await Promise.all([out.promise, err.promise]);
+      let drained = false;
+      stopping = Promise.resolve(f.service.shutdown()).then(() => {
+        drained = true;
+      });
+      await f.service.status();
+      assert.isFalse(drained, "shutdown must wait for blocked pipe writes");
+      releaseOut.resolve();
+      await f.service.status();
+      assert.isFalse(drained, "stderr drain still owns the execution slot");
+      releaseErr.resolve();
+      await cleanup.promise;
+      assert.isFalse(drained, "sensitive scratch cleanup still owns the slot");
+      releaseCleanup.resolve();
+      await flush.promise;
+      assert.isFalse(drained, "terminal state is not durable yet");
+      releaseFlush.resolve();
+      await stopping;
+      assert.isFalse(f.service.busy);
+      IOUtils.writeUTF8 = writeUTF8;
+      replacement = new MineruTaskService({ storageRoot: f.storageRoot });
+      await replacement.initialize();
+      assert.equal(replacement.get(next.taskID).state, "queued");
+      const admitted = await replacement.submit({
+        requestID: "replacement-ack",
+        source: f.sourceID,
+      });
+      await replacement.move(admitted.taskID, { before: next.taskID });
+      const saved = JSON.parse(
+        await IOUtils.readUTF8(PathUtils.join(f.storageRoot, "queue.json")),
+      );
+      assert.deepEqual(saved.pending, [admitted.taskID, next.taskID]);
+      assert.equal(
+        saved.entries.find((entry: any) => entry.record.taskID === first.taskID)
+          .record.state,
+        f.service.get(first.taskID).state,
+      );
+    } finally {
+      releaseOut.resolve();
+      releaseErr.resolve();
+      releaseCleanup.resolve();
+      releaseFlush.resolve();
+      IOUtils.write = write;
+      IOUtils.remove = remove;
+      IOUtils.writeUTF8 = writeUTF8;
+      await stopping;
+      await replacement?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("rejects public admission finishing validation after shutdown and drains its durable gate", async function () {
+    const f = await fixture("", true);
+    const lookup = Zotero.Items.getByLibraryAndKeyAsync;
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let submitting: Promise<unknown> | undefined;
+    let stopping: Promise<void> | undefined;
+    let replacement: MineruTaskService | undefined;
+    try {
+      Zotero.Items.getByLibraryAndKeyAsync = async (...args) => {
+        if (args[1] === f.source.key) {
+          enter();
+          await blocked;
+        }
+        return lookup.apply(Zotero.Items, args);
+      };
+      submitting = f.service
+        .submit({ requestID: "late-validation", source: f.sourceID })
+        .then(
+          () => "acknowledged",
+          (error) => (error as MineruAPIError).code,
+        );
+      await entered;
+      let drained = false;
+      const shutdown = f.service.shutdown();
+      assert.strictEqual(
+        f.service.shutdown(),
+        shutdown,
+        "shutdown is idempotent",
+      );
+      stopping = Promise.resolve(shutdown).then(() => {
+        drained = true;
+      });
+      await f.service.status();
+      assert.isFalse(
+        drained,
+        "in-flight validation must drain before replacement",
+      );
+      release();
+      assert.equal(await submitting, "plugin_not_ready");
+      await stopping;
+      Zotero.Items.getByLibraryAndKeyAsync = lookup;
+      replacement = new MineruTaskService({ storageRoot: f.storageRoot });
+      await replacement.initialize();
+      assert.isEmpty(replacement.getQueue().pending);
+      await replacement.submit({
+        requestID: "replacement",
+        source: f.sourceID,
+      });
+      assert.lengthOf(replacement.getQueue().pending, 1);
+    } finally {
+      release();
+      Zotero.Items.getByLibraryAndKeyAsync = lookup;
+      await submitting;
+      await stopping;
+      await replacement?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("awaits initialization already in flight without reopening intake after shutdown", async function () {
+    const f = await fixture("", true);
+    await f.service.shutdown();
+    const read = IOUtils.readUTF8;
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const starting = new MineruTaskService({ storageRoot: f.storageRoot });
+    let initialization: Promise<void> | undefined,
+      stopping: Promise<void> | undefined;
+    try {
+      IOUtils.readUTF8 = async (path, ...args) => {
+        if (path === PathUtils.join(f.storageRoot, "queue.json")) {
+          enter();
+          await blocked;
+        }
+        return read.call(IOUtils, path, ...args);
+      };
+      initialization = starting.initialize();
+      await entered;
+      let drained = false;
+      stopping = starting.shutdown().then(() => {
+        drained = true;
+      });
+      await starting.status();
+      assert.isFalse(drained);
+      release();
+      await initialization;
+      await stopping;
+      assert.isFalse((await starting.status()).plugin.ready);
+      try {
+        await starting.submit({
+          requestID: "stopped-startup",
+          source: f.sourceID,
+        });
+        assert.fail("stopped initialization cannot admit work");
+      } catch (error) {
+        assert.equal((error as MineruAPIError).code, "plugin_not_ready");
+      }
+    } finally {
+      release();
+      IOUtils.readUTF8 = read;
+      await initialization;
+      await stopping;
+      await starting.shutdown();
+      await f.clean();
+    }
+  });
 
   it("publishes once, replays requests, reuses valid results, and retains superseded results", async function () {
     const f = await fixture();
@@ -611,7 +852,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         "lowering cap does not evict work",
       );
       assert.equal(f.service.getQueue().remainingCapacity, 0);
-      f.service.shutdown();
+      await f.service.shutdown();
       recovered = new MineruTaskService({ storageRoot: f.storageRoot });
       await recovered.initialize();
       assert.isTrue(recovered.getQueue().paused);
@@ -662,7 +903,7 @@ describe("MinerU shared task service and local HTTP API", function () {
       );
       assert.deepEqual(recovered.getQueue().pending, []);
     } finally {
-      recovered?.shutdown();
+      await recovered?.shutdown();
       await f.clean();
     }
   });
@@ -848,7 +1089,7 @@ describe("MinerU shared task service and local HTTP API", function () {
           .taskID,
       );
       await f.service.pause();
-      f.service.shutdown();
+      await f.service.shutdown();
       const path = PathUtils.join(f.storageRoot, "queue.json");
       const saved = JSON.parse(await IOUtils.readUTF8(path));
       const entry = saved.entries.find(
@@ -870,7 +1111,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         source: f.sourceID,
         force: true,
       });
-      restarted.shutdown();
+      await restarted.shutdown();
       const unknown = JSON.parse(await IOUtils.readUTF8(path));
       const active = unknown.entries.find(
         (item: any) => item.record.taskID === forced.taskID,
@@ -900,7 +1141,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         first.result!.itemKey,
       );
     } finally {
-      restarted?.shutdown();
+      await restarted?.shutdown();
       await f.clean();
     }
   });
@@ -933,7 +1174,7 @@ describe("MinerU shared task service and local HTTP API", function () {
       );
       assert.isFalse((await f.service.status()).storageReady);
       IOUtils.writeUTF8 = original;
-      f.service.shutdown();
+      await f.service.shutdown();
       await IOUtils.writeUTF8(path, "{corrupt");
       broken = new MineruTaskService({ storageRoot: f.storageRoot });
       try {
@@ -954,7 +1195,9 @@ describe("MinerU shared task service and local HTTP API", function () {
       assert.equal(await IOUtils.readUTF8(path), "{corrupt");
     } finally {
       IOUtils.writeUTF8 = original;
-      broken?.shutdown();
+      await broken
+        ?.shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
       await f.clean();
     }
   });
@@ -1088,7 +1331,12 @@ describe("MinerU shared task service and local HTTP API", function () {
         assert.isFalse((await f.service.status()).storageReady);
         assert.equal(f.service.get(second.taskID).state, "queued");
         IOUtils.writeUTF8 = original;
-        f.service.shutdown();
+        try {
+          await f.service.shutdown();
+          assert.fail("failed terminal flush must reject shutdown");
+        } catch (error) {
+          assert.instanceOf(error, AggregateError);
+        }
         recovered = new MineruTaskService({ storageRoot: f.storageRoot });
         await recovered.initialize();
         assert.equal(recovered.get(first.taskID).state, "succeeded");
@@ -1102,7 +1350,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         assert.lengthOf((await recovered.results(f.sourceID)).results, 1);
       } finally {
         IOUtils.writeUTF8 = original;
-        recovered?.shutdown();
+        await recovered?.shutdown();
         await f.clean();
       }
     });
@@ -1179,7 +1427,12 @@ describe("MinerU shared task service and local HTTP API", function () {
       assert.isFalse((await f.service.status()).recoveryReady);
       assert.equal(f.service.get(next.taskID).state, "queued");
       IOUtils.remove = original;
-      f.service.shutdown();
+      try {
+        await f.service.shutdown();
+        assert.fail("uncertain cleanup must reject shutdown");
+      } catch (error) {
+        assert.instanceOf(error, AggregateError);
+      }
       recovered = new MineruTaskService({ storageRoot: f.storageRoot });
       await recovered.initialize();
       assert.isEmpty(
@@ -1190,7 +1443,7 @@ describe("MinerU shared task service and local HTTP API", function () {
       assert.equal(recovered.get(next.taskID).state, "queued");
     } finally {
       IOUtils.remove = original;
-      recovered?.shutdown();
+      await recovered?.shutdown();
       await f.clean();
     }
   });
@@ -1280,7 +1533,7 @@ describe("MinerU shared task service and local HTTP API", function () {
     try {
       const request = { requestID: "restart-late", source: f.sourceID };
       const queued = await f.service.submit(request);
-      f.service.shutdown();
+      await f.service.shutdown();
       Zotero.Prefs.set(`${config.prefsPrefix}.imageAnalysis`, false, true);
       recovered = new MineruTaskService({ storageRoot: f.storageRoot });
       await recovered.initialize();
@@ -1296,7 +1549,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         "replay never refreshes a completed execution",
       );
     } finally {
-      recovered?.shutdown();
+      await recovered?.shutdown();
       await f.clean();
     }
   });
