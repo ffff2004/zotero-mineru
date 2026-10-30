@@ -12,4 +12,6 @@ pref-tier = 解析级别 tier
 pref-ocr = OCR 模式
 pref-images = 图像分析
 pref-pages = 页范围
-pref-pages-help = MinerU 语法：all、1-5 或 r1。修改会在下一个任务生效。
+pref-pages-help = MinerU 语法：all、1-5 或 r1。排队任务开始时读取默认值；agent 的显式参数优先。
+pref-queue-limit = 队列上限（待执行任务）
+pref-queue-limit-help = 默认 10，不含当前任务。请输入 1–2147483647 的整数（Zotero 整数偏好设置支持的范围）。调低上限不删除已有任务；新提交必须符合剩余容量。

@@ -61,9 +61,14 @@ also needs npm available.
 
 - The menu and local HTTP API share one MinerU task service. Endpoint prefixes
   come from `package.json` config; HTTP requests identify Zotero items by library
-  ID and item key. See `docs/local-api.md` for the protocol. Task records are
-  session-local; published results and publication recovery journals survive
-  restarts.
+  ID and item key. For queue clients, lifecycle changes or recovery work, read
+  [the v2 protocol](docs/local-api.md). Task/order/request records are durable;
+  startup recovers correlated publications before reconciling old active tasks
+  and stays paused. The service owns the serialized durable mutation gate;
+  controller terminal callbacks do not release its execution slot. Persist only
+  safe execution identities/hashes, never configuration/environment contents or
+  Zotero objects. Raw diagnostic logs are private, not redacted, and expire with
+  task history; sensitive parse scratch is separate and cleaned before dispatch.
 
 - Integration tests exercise the plugin instance and MinerU public module interfaces.
   Set `ZOTERO_PLUGIN_ZOTERO_BIN_PATH` using `.env.example`. Tests use a disposable

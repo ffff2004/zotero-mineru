@@ -334,7 +334,7 @@ describe("MinerU selection and task interface", function () {
       );
       assert.include(
         await IOUtils.readUTF8(failed.logs!.stderr),
-        `config=${PathUtils.join(PathUtils.parent(failed.logs!.stdout)!, "config.yaml")}`,
+        `config=${PathUtils.join(PathUtils.parent(failed.logs!.stdout)!, "scratch", "config.yaml")}`,
       );
     } finally {
       Services.env.set("MINERU_CONFIG", oldConfig);

@@ -3,6 +3,7 @@
 const MAIN_FILE = "markdown.md";
 const SENTINEL = "zotero-mineru-generation:v1";
 const JOURNAL_DIR = "mineru-publication-journal";
+const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 type FileRecord = { path: string; size: number; sha256: string };
 type PackageRecord = { files: FileRecord[]; directories: string[] };
@@ -17,14 +18,27 @@ type Identity = {
   collections: number[];
 };
 type Journal = {
-  version: 1;
+  version: 1 | 2;
+  owner?: PublicationOwner;
   token: string;
   phase: "staging" | "publishing" | "committed";
   package: PackageRecord;
   identity?: Identity;
 };
 
+export type PublicationOwner = { taskID: string; attemptID: string };
+export type PublicationCompletion = PublicationOwner & {
+  token: string;
+  result: { libraryID: number; itemKey: string };
+};
+type AcknowledgeCompletion = (
+  completion: PublicationCompletion,
+) => Promise<void>;
+
 export type PublicationRequest = {
+  /** Correlated queue attempts retain their journal until durable acknowledgement. */
+  owner?: PublicationOwner;
+  acknowledgeCompletion?: AcknowledgeCompletion;
   /** Root of a fully validated export, including provenance.json. */
   packageDirectory: string;
   /** The exact PDF attachment selected for this parse. */
@@ -73,6 +87,51 @@ function journalPath(token: string): string {
   return pathFor(journalDirectory(), `${token}.json`);
 }
 
+/** Never follow a redirected private root or a token-shaped symlink/special file. */
+function verifiedJournalDirectory(): string {
+  const path = journalDirectory();
+  const root = Zotero.File.pathToFile(path);
+  if (!PathUtils.isAbsolute(path) || root.isSymlink() || !root.isDirectory())
+    throw new Error("Unsafe publication journal directory");
+  const resolved = root.clone();
+  resolved.normalize();
+  if (resolved.path !== path)
+    throw new Error(
+      "Publication journal directory is not its resolved owned root",
+    );
+  return path;
+}
+
+function verificationPath(token: string): string {
+  if (!TOKEN.test(token))
+    throw new Error("Unsupported verification archive token");
+  const path = pathFor(verifiedJournalDirectory(), `${token}.zip`);
+  const file = Zotero.File.pathToFile(path);
+  let symlink = false;
+  try {
+    symlink = file.isSymlink();
+  } catch (error) {
+    if (
+      (error as { result?: number }).result !==
+      Components.results.NS_ERROR_FILE_NOT_FOUND
+    )
+      throw error;
+  }
+  if (symlink || (file.exists() && !file.isFile()))
+    throw new Error("Unsafe publication verification archive");
+  if (file.exists()) {
+    const resolved = file.clone();
+    resolved.normalize();
+    if (resolved.path !== path)
+      throw new Error("Verification archive escapes its resolved owned root");
+  }
+  return path;
+}
+
+async function removeVerification(token: string): Promise<void> {
+  await IOUtils.remove(verificationPath(token), { ignoreAbsent: true });
+}
+
 function storageDirectory(): string {
   return Zotero.getStorageDirectory().path;
 }
@@ -91,6 +150,7 @@ async function saveJournal(journal: Journal): Promise<void> {
     ignoreExisting: true,
     permissions: 0o700,
   });
+  verifiedJournalDirectory();
   const path = journalPath(journal.token);
   await IOUtils.writeUTF8(path, JSON.stringify(journal), {
     tmpPath: `${path}.tmp`,
@@ -99,6 +159,8 @@ async function saveJournal(journal: Journal): Promise<void> {
 }
 
 async function removeJournal(journal: Journal): Promise<void> {
+  // Retain recovery evidence until every sensitive verification archive is gone.
+  await removeVerification(journal.token);
   await IOUtils.remove(journalPath(journal.token), { ignoreAbsent: true });
 }
 
@@ -212,7 +274,7 @@ async function assertZipContents(
   record: PackageRecord,
   token: string,
 ): Promise<void> {
-  const zipPath = pathFor(journalDirectory(), `${token}.zip`);
+  const zipPath = verificationPath(token);
   try {
     if ((await Zotero.File.zipDirectory(root, zipPath, null)) === false) {
       throw new Error("Zotero could not create the attachment upload ZIP");
@@ -239,7 +301,7 @@ async function assertZipContents(
       reader.close();
     }
   } finally {
-    await IOUtils.remove(zipPath, { ignoreAbsent: true });
+    await removeVerification(token);
   }
 }
 
@@ -360,9 +422,48 @@ async function verifyCommitted(
 
 async function recoverOne(
   journal: Journal,
+  acknowledgeCompletion?: AcknowledgeCompletion,
 ): Promise<"committed" | "rolledBack"> {
+  // Cleanup failure must retain the journal, even before an item was created.
+  await removeVerification(journal.token);
   const identity = journal.identity;
+  const acknowledge = async () => {
+    if (journal.version !== 2) return;
+    if (!journal.owner || !journal.identity || !acknowledgeCompletion)
+      throw new Error(
+        "Correlated publication requires durable owner acknowledgement",
+      );
+    await acknowledgeCompletion({
+      ...journal.owner,
+      token: journal.token,
+      result: {
+        libraryID: journal.identity.libraryID,
+        itemKey: journal.identity.key,
+      },
+    });
+  };
   if (journal.phase === "committed") {
+    if (journal.version === 2) {
+      if (
+        !identity ||
+        !/^[A-Z0-9]{8}$/.test(identity.key) ||
+        !Number.isSafeInteger(identity.id) ||
+        identity.id <= 0 ||
+        !Number.isSafeInteger(identity.libraryID)
+      )
+        throw new Error("Invalid correlated committed identity");
+      const item =
+        journal.identity &&
+        (await Zotero.Items.getByLibraryAndKeyAsync(
+          journal.identity.libraryID,
+          journal.identity.key,
+        ));
+      if (!item || !(await verifyCommitted(journal, item, false)))
+        throw new Error(
+          "Committed correlated publication could not be verified",
+        );
+      await acknowledge();
+    }
     await IOUtils.remove(stagePath(journal.token), {
       recursive: true,
       ignoreAbsent: true,
@@ -404,6 +505,7 @@ async function recoverOne(
           recursive: true,
           ignoreAbsent: true,
         });
+        await acknowledge();
         await removeJournal(journal);
         return "committed";
       }
@@ -443,25 +545,46 @@ async function recoverOne(
 }
 
 /** Resolve only this plugin's journal entries; never scan or delete old results. */
-export async function recoverIncompletePublications(): Promise<RecoveryResult> {
+export async function recoverIncompletePublications(
+  acknowledgeCompletion?: AcknowledgeCompletion,
+): Promise<RecoveryResult> {
   if (active) throw new Error("Publication or recovery is already running");
   active = true;
   const result = { committed: 0, rolledBack: 0 };
   const failures: Error[] = [];
   try {
     if (!(await IOUtils.exists(journalDirectory()))) return result;
-    for (const path of await IOUtils.getChildren(journalDirectory())) {
-      if (!/^[0-9a-f-]{36}\.json$/.test(PathUtils.filename(path))) continue;
+    const root = verifiedJournalDirectory();
+    for (const path of await IOUtils.getChildren(root)) {
+      const name = PathUtils.filename(path);
+      if (name.endsWith(".zip") && TOKEN.test(name.slice(0, -4))) {
+        try {
+          const token = name.slice(0, -4);
+          if (path !== verificationPath(token))
+            throw new Error("Unexpected verification archive cleanup path");
+          await removeVerification(token);
+        } catch (error) {
+          failures.push(
+            new Error(`Could not clean verification archive: ${String(error)}`),
+          );
+        }
+        continue;
+      }
+      if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
       try {
         const journal = JSON.parse(await IOUtils.readUTF8(path)) as Journal;
         if (
-          journal.version !== 1 ||
+          ![1, 2].includes(journal.version) ||
+          (journal.version === 2 &&
+            (!journal.owner ||
+              !/^[0-9a-f-]{36}$/.test(journal.owner.taskID) ||
+              !/^[0-9a-f-]{36}$/.test(journal.owner.attemptID))) ||
           journalPath(journal.token) !== path ||
           !["staging", "publishing", "committed"].includes(journal.phase)
         ) {
           throw new Error(`Invalid publication journal ${path}`);
         }
-        const outcome = await recoverOne(journal);
+        const outcome = await recoverOne(journal, acknowledgeCompletion);
         result[outcome]++;
       } catch (error) {
         failures.push(new Error(`Could not recover ${path}: ${String(error)}`));
@@ -487,7 +610,13 @@ export async function publishValidatedPackage(
     const packageRecord = await describeTree(request.packageDirectory);
     await currentSource(request.sourcePDF);
     const token = crypto.randomUUID();
-    journal = { version: 1, token, phase: "staging", package: packageRecord };
+    journal = {
+      version: request.owner ? 2 : 1,
+      owner: request.owner,
+      token,
+      phase: "staging",
+      package: packageRecord,
+    };
     await saveJournal(journal);
     await copyPackage(
       request.packageDirectory,
@@ -546,6 +675,15 @@ export async function publishValidatedPackage(
     }
     journal.phase = "committed";
     await saveJournal(journal);
+    if (journal.owner) {
+      if (!request.acknowledgeCompletion)
+        throw new Error("Missing durable publication acknowledgement");
+      await request.acknowledgeCompletion({
+        ...journal.owner,
+        token,
+        result: { libraryID: created.libraryID, itemKey: created.key },
+      });
+    }
     await removeJournal(journal);
     return created;
   } catch (error) {
@@ -569,8 +707,18 @@ export async function publishValidatedPackage(
       try {
         if (journal) {
           request.onRecovery?.({ event: "start", publicationError: error });
-          const outcome = await recoverOne(journal);
+          const outcome = await recoverOne(
+            journal,
+            request.acknowledgeCompletion,
+          );
           request.onRecovery?.({ event: "complete", outcome });
+          if (outcome === "committed" && journal.identity) {
+            const committed = await Zotero.Items.getByLibraryAndKeyAsync(
+              journal.identity.libraryID,
+              journal.identity.key,
+            );
+            if (committed) return committed;
+          }
         }
       } catch (cleanupError) {
         request.onRecovery?.({ event: "error", error: cleanupError });

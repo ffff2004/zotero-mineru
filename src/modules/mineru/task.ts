@@ -3,6 +3,8 @@ import { runMineruParse, MineruTaskError, type PreparedParse } from "./parse";
 import {
   PublicationRecoveryError,
   publishValidatedPackage,
+  type PublicationOwner,
+  type PublicationCompletion,
 } from "./publication";
 import {
   safeDiagnostic,
@@ -27,6 +29,12 @@ export type TaskState =
   | "cancelled";
 export type TaskSnapshot = PreparedParse & { source: Zotero.Item };
 export type TaskLifecycle = {
+  owner?: PublicationOwner;
+  acknowledgeCompletion?: (completion: PublicationCompletion) => Promise<void>;
+  acknowledgeReuse?: (item: Zotero.Item) => Promise<void>;
+  scratchDirectory?: string;
+  diagnosticsDirectory?: string;
+  onSnapshot?: (snapshot: TaskSnapshot) => Promise<void>;
   findReusable?: (snapshot: TaskSnapshot) => Promise<Zotero.Item | undefined>;
 };
 export type TaskView = {
@@ -146,8 +154,11 @@ export class MineruTaskController {
     let logs: TaskView["logs"];
     let configPath: string | undefined;
     let publicationErrorReported = false;
+    let scratchDirectory: string | undefined;
     const emit = (record?: PluginLogRecord, extra?: Partial<TaskView>) => {
-      if (this.alive)
+      // A durable owner must observe the actual outcome even while shutdown
+      // suppresses standalone/UI callbacks; its final flush still owns the slot.
+      if (this.alive || lifecycle.owner)
         report({ phase, state, snapshot, logs, configPath, record, ...extra });
     };
     this.reportCancellation = () => {
@@ -174,252 +185,284 @@ export class MineruTaskController {
     };
     // The first record precedes every asynchronous operation under the lock.
     log(stage, "start", "Checking runtime and preparing PDF");
-    try {
-      const frozenSettings = {
-        descriptorPath: settings.descriptorPath,
-        customConfigPath: settings.customConfigPath,
-        options: { ...settings.options },
-      };
-      let runtime;
+    const execute = async (): Promise<Zotero.Item | undefined> => {
       try {
-        runtime = await freezeRuntime({
-          descriptorPath: frozenSettings.descriptorPath || undefined,
-          customConfigPath: frozenSettings.customConfigPath,
-        });
-      } catch (error) {
-        throw new MineruTaskError(
-          "environment",
-          "MinerU runtime is missing or incompatible; run the companion installer",
-          undefined,
-          error,
-        );
-      }
-      configPath = runtime.configPath;
-      checkCancelled();
-      const source = await resolveSelectedPDF(items, choose);
-      checkCancelled();
-      let path = await source.getFilePathAsync();
-      if (!path && source.isStoredFileAttachment()) {
+        const frozenSettings = {
+          descriptorPath: settings.descriptorPath,
+          customConfigPath: settings.customConfigPath,
+          options: { ...settings.options },
+        };
+        let runtime;
         try {
-          await (Zotero.Sync.Runner as any).downloadFile(source);
+          runtime = await freezeRuntime({
+            descriptorPath: frozenSettings.descriptorPath || undefined,
+            customConfigPath: frozenSettings.customConfigPath,
+          });
         } catch (error) {
           throw new MineruTaskError(
-            "input",
-            "Stored PDF download failed; retry Zotero file sync",
+            "environment",
+            "MinerU runtime is missing or incompatible; run the companion installer",
             undefined,
             error,
           );
         }
+        configPath = runtime.configPath;
         checkCancelled();
-        path = await source.getFilePathAsync();
-      }
-      if (!path) {
-        throw new MineruTaskError(
-          "input",
-          source.isStoredFileAttachment()
-            ? "Stored PDF download failed; retry Zotero file sync"
-            : "Linked PDF file is missing; restore or relink the PDF",
-        );
-      }
-      checkCancelled();
-      let reused: Zotero.Item | undefined;
-      const parsed = await runMineruParse({
-        pdfPath: path,
-        runtime,
-        options: frozenSettings.options,
-        signal: abort.signal,
-        onPreparedSnapshot: async (prepared) => {
-          snapshot = { ...prepared, source };
-          reused = await lifecycle.findReusable?.(snapshot);
-          return !!reused;
-        },
-        onPrepared: () =>
-          log(
-            "preparing",
-            "complete",
-            "PDF snapshot and CLI log files are ready",
-          ),
-        onParseStart: () => {
-          stage = "parsing";
-          phase = "parsing";
-          log(stage, "start", "Starting MinerU parsing and export");
-        },
-        onValidation: () => {
-          log(
-            "parsing",
-            "complete",
-            "MinerU process exited with status 0; export still requires validation",
+        const source = await resolveSelectedPDF(items, choose);
+        checkCancelled();
+        let path = await source.getFilePathAsync();
+        if (!path && source.isStoredFileAttachment()) {
+          try {
+            await (Zotero.Sync.Runner as any).downloadFile(source);
+          } catch (error) {
+            throw new MineruTaskError(
+              "input",
+              "Stored PDF download failed; retry Zotero file sync",
+              undefined,
+              error,
+            );
+          }
+          checkCancelled();
+          path = await source.getFilePathAsync();
+        }
+        if (!path) {
+          throw new MineruTaskError(
+            "input",
+            source.isStoredFileAttachment()
+              ? "Stored PDF download failed; retry Zotero file sync"
+              : "Linked PDF file is missing; restore or relink the PDF",
           );
-          stage = "validation";
-          phase = "validation";
-          log(stage, "start", "Checking ZIP and result package");
-        },
-        onLogs: (files) => {
-          logs = files;
-          emit();
-        },
-      });
-      if ("skipped" in parsed) {
+        }
         checkCancelled();
+        let reused: Zotero.Item | undefined;
+        const parsed = await runMineruParse({
+          scratchDirectory: lifecycle.scratchDirectory,
+          diagnosticsDirectory: lifecycle.diagnosticsDirectory,
+          pdfPath: path,
+          runtime,
+          options: frozenSettings.options,
+          signal: abort.signal,
+          onPreparedSnapshot: async (prepared) => {
+            snapshot = { ...prepared, source };
+            await lifecycle.onSnapshot?.(snapshot);
+            reused = await lifecycle.findReusable?.(snapshot);
+            if (reused) await lifecycle.acknowledgeReuse?.(reused);
+            return !!reused;
+          },
+          onPrepared: () =>
+            log(
+              "preparing",
+              "complete",
+              "PDF snapshot and CLI log files are ready",
+            ),
+          onParseStart: () => {
+            stage = "parsing";
+            phase = "parsing";
+            log(stage, "start", "Starting MinerU parsing and export");
+          },
+          onValidation: () => {
+            log(
+              "parsing",
+              "complete",
+              "MinerU process exited with status 0; export still requires validation",
+            );
+            stage = "validation";
+            phase = "validation";
+            log(stage, "start", "Checking ZIP and result package");
+          },
+          onLogs: (files) => {
+            logs = files;
+            emit();
+          },
+        });
+        if ("skipped" in parsed) {
+          phase = "done";
+          state = "succeeded";
+          logs = undefined;
+          emit(
+            {
+              timestamp: new Date().toISOString(),
+              stage: "task",
+              event: "success",
+              message: "Reused a complete attachment for this PDF snapshot",
+            },
+            { result: reused, reused: true },
+          );
+          return reused;
+        }
+        scratchDirectory = parsed.taskDirectory;
+        logs = { stdout: parsed.stdoutLog, stderr: parsed.stderrLog };
+        checkCancelled();
+        log("validation", "complete", "Result package validated");
+        stage = "saving";
+        phase = "saving";
+        log(stage, "start", "Publishing the complete attachment");
+        const result = await publishValidatedPackage({
+          owner: lifecycle.owner,
+          acknowledgeCompletion: lifecycle.acknowledgeCompletion,
+          packageDirectory: parsed.packageDirectory,
+          sourcePDF: source,
+          signal: abort.signal,
+          onRecovery: (event) => {
+            if (!publicationErrorReported) {
+              publicationErrorReported = true;
+              log(
+                "saving",
+                "error",
+                event.kind === "finalization"
+                  ? "Attachment journal finalization could not be confirmed"
+                  : "Could not confirm attachment publication",
+                event.publicationError,
+              );
+            }
+            log(
+              "recovery",
+              event.event,
+              event.event === "start"
+                ? "Checking rollback and cleanup of this new attachment"
+                : event.event === "error"
+                  ? event.kind === "finalization"
+                    ? "Attachment journal finalization is incomplete; a recovery journal was retained. Restart Zotero to retry recovery"
+                    : "Recovery could not finish; a recovery journal was retained. Restart Zotero to retry recovery"
+                  : event.outcome === "committed"
+                    ? "Confirmed complete attachment; recovery journal removed"
+                    : "New attachment rolled back and temporary publication files cleaned; recovery journal removed",
+              event.error,
+            );
+          },
+        });
+        // Publication has committed and completed recovery/finalization. A late
+        // cancellation cannot turn an already saved attachment into cancellation.
+        log("saving", "complete", "Complete attachment publication confirmed");
         phase = "done";
         state = "succeeded";
-        logs = undefined;
         emit(
           {
             timestamp: new Date().toISOString(),
             stage: "task",
             event: "success",
-            message: "Reused a complete attachment for this PDF snapshot",
+            message: "Task completed",
           },
-          { result: reused, reused: true },
+          { result, reused: false },
         );
-        return reused;
-      }
-      logs = { stdout: parsed.stdoutLog, stderr: parsed.stderrLog };
-      checkCancelled();
-      log("validation", "complete", "Result package validated");
-      stage = "saving";
-      phase = "saving";
-      log(stage, "start", "Publishing the complete attachment");
-      const result = await publishValidatedPackage({
-        packageDirectory: parsed.packageDirectory,
-        sourcePDF: source,
-        signal: abort.signal,
-        onRecovery: (event) => {
+        return result;
+      } catch (error) {
+        if (error instanceof MineruTaskError && error.logs) logs = error.logs;
+        const cancelled =
+          (error instanceof MineruTaskError &&
+            error.category === "cancelled") ||
+          (abort.signal.aborted &&
+            error instanceof Error &&
+            error.message === "MinerU task stopped" &&
+            !(error instanceof PublicationRecoveryError));
+        if (cancelled) {
+          phase = "cancelled";
+          state = "cancelled";
+          emit(
+            {
+              timestamp: new Date().toISOString(),
+              stage: "task",
+              event: "complete",
+              message: "Task cancelled; no new result was published",
+            },
+            { message: "MinerU task cancelled", errorCode: "CANCELLED" },
+          );
+        } else {
+          const category =
+            error instanceof PublicationRecoveryError
+              ? "recovery"
+              : stage === "saving"
+                ? "persistence"
+                : error instanceof MineruTaskError
+                  ? error.category
+                  : undefined;
+          const message =
+            error instanceof PublicationRecoveryError
+              ? error.kind === "finalization"
+                ? "Result completion could not be confirmed; a recovery journal was retained. Restart Zotero to retry recovery"
+                : "Could not save result; rollback or cleanup failed and a recovery journal was retained. Restart Zotero to retry recovery"
+              : stage === "saving"
+                ? "Could not save result; check source and library permissions and diagnostic details"
+                : error instanceof MineruTaskError
+                  ? error.message
+                  : "MinerU task failed; check diagnostic details";
           if (!publicationErrorReported) {
-            publicationErrorReported = true;
             log(
-              "saving",
+              stage,
               "error",
-              event.kind === "finalization"
-                ? "Attachment journal finalization could not be confirmed"
-                : "Could not confirm attachment publication",
-              event.publicationError,
+              error instanceof MineruTaskError && error.exitCode !== undefined
+                ? `${message}. Observed MinerU process exit status: ${error.exitCode}. Inspect Open stdout / Open stderr`
+                : message,
+              error,
             );
           }
-          log(
-            "recovery",
-            event.event,
-            event.event === "start"
-              ? "Checking rollback and cleanup of this new attachment"
-              : event.event === "error"
-                ? event.kind === "finalization"
-                  ? "Attachment journal finalization is incomplete; a recovery journal was retained. Restart Zotero to retry recovery"
-                  : "Recovery could not finish; a recovery journal was retained. Restart Zotero to retry recovery"
-                : event.outcome === "committed"
-                  ? "Confirmed complete attachment; recovery journal removed"
-                  : "New attachment rolled back and temporary publication files cleaned; recovery journal removed",
-            event.error,
-          );
-        },
-      });
-      // Publication has committed and completed recovery/finalization. A late
-      // cancellation cannot turn an already saved attachment into cancellation.
-      log("saving", "complete", "Complete attachment publication confirmed");
-      phase = "done";
-      state = "succeeded";
-      emit(
-        {
-          timestamp: new Date().toISOString(),
-          stage: "task",
-          event: "success",
-          message: "Task completed",
-        },
-        { result, reused: false },
-      );
-      return result;
-    } catch (error) {
-      if (error instanceof MineruTaskError && error.logs) logs = error.logs;
-      const cancelled =
-        (error instanceof MineruTaskError && error.category === "cancelled") ||
-        (abort.signal.aborted &&
-          error instanceof Error &&
-          error.message === "MinerU task stopped" &&
-          !(error instanceof PublicationRecoveryError));
-      if (cancelled) {
-        phase = "cancelled";
-        state = "cancelled";
-        emit(
-          {
-            timestamp: new Date().toISOString(),
-            stage: "task",
-            event: "complete",
-            message: "Task cancelled; no new result was published",
-          },
-          { message: "MinerU task cancelled", errorCode: "CANCELLED" },
-        );
-      } else {
-        const category =
-          error instanceof PublicationRecoveryError
-            ? "recovery"
-            : stage === "saving"
-              ? "persistence"
-              : error instanceof MineruTaskError
-                ? error.category
-                : undefined;
-        const message =
-          error instanceof PublicationRecoveryError
-            ? error.kind === "finalization"
-              ? "Result completion could not be confirmed; a recovery journal was retained. Restart Zotero to retry recovery"
-              : "Could not save result; rollback or cleanup failed and a recovery journal was retained. Restart Zotero to retry recovery"
-            : stage === "saving"
-              ? "Could not save result; check source and library permissions and diagnostic details"
-              : error instanceof MineruTaskError
-                ? error.message
-                : "MinerU task failed; check diagnostic details";
-        if (!publicationErrorReported) {
-          log(
-            stage,
-            "error",
-            error instanceof MineruTaskError && error.exitCode !== undefined
-              ? `${message}. Observed MinerU process exit status: ${error.exitCode}. Inspect Open stdout / Open stderr`
-              : message,
-            error,
+          if (error instanceof MineruTaskError) {
+            for (const cleanupError of error.cleanupErrors || [])
+              log(
+                "recovery",
+                "error",
+                "Could not stop the MinerU child process; no result will be published",
+                cleanupError,
+              );
+          }
+          phase = "failed";
+          state = "failed";
+          emit(
+            {
+              timestamp: new Date().toISOString(),
+              stage: "task",
+              event: "failure",
+              message: "Task failed",
+            },
+            {
+              message,
+              failureCategory: category,
+              errorCode:
+                category === "recovery"
+                  ? "RECOVERY_FAILED"
+                  : category === "persistence"
+                    ? "PUBLICATION_FAILED"
+                    : category === "input"
+                      ? "INPUT_INVALID"
+                      : category === "environment"
+                        ? "RUNTIME_UNAVAILABLE"
+                        : category === "process"
+                          ? "PARSE_FAILED"
+                          : category === "validation"
+                            ? "VALIDATION_FAILED"
+                            : "TASK_FAILED",
+            },
           );
         }
-        if (error instanceof MineruTaskError) {
-          for (const cleanupError of error.cleanupErrors || [])
-            log(
-              "recovery",
-              "error",
-              "Could not stop the MinerU child process; no result will be published",
-              cleanupError,
-            );
-        }
-        phase = "failed";
-        state = "failed";
-        emit(
-          {
-            timestamp: new Date().toISOString(),
-            stage: "task",
-            event: "failure",
-            message: "Task failed",
-          },
-          {
-            message,
-            failureCategory: category,
-            errorCode:
-              category === "recovery"
-                ? "RECOVERY_FAILED"
-                : category === "persistence"
-                  ? "PUBLICATION_FAILED"
-                  : category === "input"
-                    ? "INPUT_INVALID"
-                    : category === "environment"
-                      ? "RUNTIME_UNAVAILABLE"
-                      : category === "process"
-                        ? "PARSE_FAILED"
-                        : category === "validation"
-                          ? "VALIDATION_FAILED"
-                          : "TASK_FAILED",
-          },
-        );
+        return undefined;
       }
-      return undefined;
+    };
+    let outcome: Zotero.Item | undefined;
+    let failure: unknown;
+    try {
+      outcome = await execute();
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      if (scratchDirectory)
+        await IOUtils.remove(scratchDirectory, {
+          recursive: true,
+          ignoreAbsent: true,
+        });
+    } catch (error) {
+      failure = new MineruTaskError(
+        "cleanup",
+        "Sensitive task scratch cleanup failed",
+        logs,
+        error,
+      );
     } finally {
       this.active = false;
       this.abort = undefined;
       this.reportCancellation = undefined;
     }
+    if (failure) throw failure;
+    return outcome;
   }
 }

@@ -44,4 +44,19 @@
   <html:label for="mineru-pages" data-l10n-id="pref-pages"></html:label>
   <html:input id="mineru-pages" type="text" placeholder="all" />
   <html:p data-l10n-id="pref-pages-help"></html:p>
+  <html:label
+    for="mineru-queue-limit"
+    data-l10n-id="pref-queue-limit"
+  ></html:label>
+  <html:input
+    id="mineru-queue-limit"
+    type="text"
+    inputmode="numeric"
+    aria-describedby="mineru-queue-limit-help mineru-queue-limit-error"
+  />
+  <html:p
+    id="mineru-queue-limit-help"
+    data-l10n-id="pref-queue-limit-help"
+  ></html:p>
+  <html:p id="mineru-queue-limit-error" role="alert"></html:p>
 </groupbox>

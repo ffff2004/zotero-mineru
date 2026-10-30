@@ -5,8 +5,8 @@ directory, as `--bundle`. A manifest preserves source Zotero identity alongside
 the file paths; a directory alone has only provenance's input SHA-256.
 
 ```bash
-uv run --no-project python <skill-dir>/scripts/mineru.py --out candidates.json locate --bundle result.json --query 'E = mc^2'
-uv run --no-project python <skill-dir>/scripts/mineru.py --out candidates.json locate --bundle result.json --line 120 --context 2
+uv run <skill-dir>/scripts/mineru.py --out candidates.json locate --bundle result.json --query 'E = mc^2'
+uv run <skill-dir>/scripts/mineru.py --out candidates.json locate --bundle result.json --line 120 --context 2
 ```
 
 Clues can be text, LaTeX, a caption or an image path. The helper normalizes
@@ -39,14 +39,14 @@ separate adapter. Out-of-range coordinates are errors, not silently clamped.
 
 ## Render
 
-PyMuPDF is needed only for this step. The other helper commands use Python's
-standard library. Select a zero-based `--candidate` index whenever there are
+uv installs the script's declared PyMuPDF dependency automatically.
+Select a zero-based `--candidate` index whenever there are
 multiple regions, including several regions of one unambiguous continued table.
 Run render for each region index in the selected `regionGroup`; without an index
 the helper returns `candidate_required`.
 
 ```bash
-uv run --no-project --with pymupdf python <skill-dir>/scripts/mineru.py render --bundle result.json --pdf SOURCE-PDF-PATH --candidates candidates.json --candidate 0 --directory verification
+uv run <skill-dir>/scripts/mineru.py render --bundle result.json --pdf SOURCE-PDF-PATH --candidates candidates.json --candidate 0 --directory verification
 ```
 
 Obtain `SOURCE-PDF-PATH` from `find`/task `source.path`. The helper verifies its

@@ -7,8 +7,9 @@ import {
 } from "../src/modules/mineru/service";
 import { localAPIBase, registerLocalAPI } from "../src/modules/mineru/localAPI";
 import { MineruAPIError } from "../src/modules/mineru/apiError";
+import type { PublicationCompletion } from "../src/modules/mineru/publication";
 
-async function fixture(scriptDelay = "") {
+async function fixture(scriptDelay = "", paused = false) {
   const dir = Zotero.getTempDirectory();
   dir.append("mineru-api-test");
   dir.createUnique(Components.interfaces.nsIFile.DIRECTORY_TYPE!, 0o700);
@@ -97,23 +98,47 @@ async function fixture(scriptDelay = "") {
     ocrMode: "auto",
     imageAnalysis: true,
     pageRange: "all",
+    queueLimit: 10,
   })) {
     const key = `${config.prefsPrefix}.${name}`;
     saved.set(key, Zotero.Prefs.get(key, true));
     Zotero.Prefs.set(key, value, true);
   }
-  const service = new MineruTaskService();
-  service.setReady(true);
+  const storageRoot = PathUtils.join(dir.path, "queue");
+  const service = new MineruTaskService({ storageRoot });
+  await service.initialize();
+  if (!paused) await service.resume();
   const sourceID = { libraryID: source.libraryID, itemKey: source.key };
   return {
     dir,
+    storageRoot,
+    descriptorPath,
     source,
     parent,
     service,
     sourceID,
     configPath,
     async clean() {
-      service.shutdown();
+      if (
+        (await service.status()).plugin.ready &&
+        (await service.status()).recoveryReady &&
+        (await service.status()).storageReady
+      ) {
+        await service.pause();
+        for (const record of service.getQueue().pending)
+          await service.cancel(record.taskID);
+        const active = service.getQueue().activeTaskID;
+        if (active) {
+          await service.cancel(active);
+          await terminal(service, active);
+        }
+      }
+      try {
+        await service.shutdown();
+      } catch (error) {
+        const status = await service.status();
+        if (status.storageReady && status.recoveryReady) throw error;
+      }
       for (const [key, value] of saved) {
         if (value === undefined) Zotero.Prefs.clear(key, true);
         else Zotero.Prefs.set(key, value as string | boolean, true);
@@ -131,7 +156,9 @@ async function terminal(
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     const task = service.get(taskID);
-    if (["succeeded", "failed", "cancelled"].includes(task.state)) {
+    if (
+      ["succeeded", "failed", "cancelled", "interrupted"].includes(task.state)
+    ) {
       while (service.busy && Date.now() < deadline)
         await Zotero.Promise.delay(10);
       return service.get(taskID);
@@ -143,6 +170,242 @@ async function terminal(
 
 describe("MinerU shared task service and local HTTP API", function () {
   this.timeout(120000);
+
+  it("awaits shutdown through both real child drains, scratch cleanup and final flush before replacement", async function () {
+    const f = await fixture("printf 'stdout'; printf 'stderr' >&2", true);
+    const write = IOUtils.write;
+    const remove = IOUtils.remove;
+    const writeUTF8 = IOUtils.writeUTF8;
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const out = deferred(),
+      err = deferred(),
+      cleanup = deferred(),
+      flush = deferred();
+    const releaseOut = deferred(),
+      releaseErr = deferred(),
+      releaseCleanup = deferred(),
+      releaseFlush = deferred();
+    let replacement: MineruTaskService | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      const first = await f.service.submit({
+        requestID: "shutdown-active",
+        source: f.sourceID,
+      });
+      const next = await f.service.submit({
+        requestID: "shutdown-pending",
+        source: f.sourceID,
+      });
+      IOUtils.write = async (path, data, ...args) => {
+        if (path.endsWith("stdout.log") && data.byteLength) {
+          out.resolve();
+          await releaseOut.promise;
+        }
+        if (path.endsWith("stderr.log") && data.byteLength) {
+          err.resolve();
+          await releaseErr.promise;
+        }
+        return write.call(IOUtils, path, data, ...args);
+      };
+      IOUtils.remove = async (path, ...args) => {
+        if (
+          path.startsWith(
+            PathUtils.join(f.storageRoot, "scratch", first.taskID),
+          )
+        ) {
+          cleanup.resolve();
+          await releaseCleanup.promise;
+        }
+        return remove.call(IOUtils, path, ...args);
+      };
+      IOUtils.writeUTF8 = async (path, content, ...args) => {
+        if (
+          path === PathUtils.join(f.storageRoot, "queue.json") &&
+          JSON.parse(content).entries.some(
+            (entry: any) =>
+              entry.record.taskID === first.taskID && entry.record.completedAt,
+          )
+        ) {
+          flush.resolve();
+          await releaseFlush.promise;
+        }
+        return writeUTF8.call(IOUtils, path, content, ...args);
+      };
+      await f.service.resume();
+      await Promise.all([out.promise, err.promise]);
+      let drained = false;
+      stopping = Promise.resolve(f.service.shutdown()).then(() => {
+        drained = true;
+      });
+      await f.service.status();
+      assert.isFalse(drained, "shutdown must wait for blocked pipe writes");
+      releaseOut.resolve();
+      await f.service.status();
+      assert.isFalse(drained, "stderr drain still owns the execution slot");
+      releaseErr.resolve();
+      await cleanup.promise;
+      assert.isFalse(drained, "sensitive scratch cleanup still owns the slot");
+      releaseCleanup.resolve();
+      await flush.promise;
+      assert.isFalse(drained, "terminal state is not durable yet");
+      releaseFlush.resolve();
+      await stopping;
+      assert.isFalse(f.service.busy);
+      IOUtils.writeUTF8 = writeUTF8;
+      replacement = new MineruTaskService({ storageRoot: f.storageRoot });
+      await replacement.initialize();
+      assert.equal(replacement.get(next.taskID).state, "queued");
+      const admitted = await replacement.submit({
+        requestID: "replacement-ack",
+        source: f.sourceID,
+      });
+      await replacement.move(admitted.taskID, { before: next.taskID });
+      const saved = JSON.parse(
+        await IOUtils.readUTF8(PathUtils.join(f.storageRoot, "queue.json")),
+      );
+      assert.deepEqual(saved.pending, [admitted.taskID, next.taskID]);
+      assert.equal(
+        saved.entries.find((entry: any) => entry.record.taskID === first.taskID)
+          .record.state,
+        f.service.get(first.taskID).state,
+      );
+    } finally {
+      releaseOut.resolve();
+      releaseErr.resolve();
+      releaseCleanup.resolve();
+      releaseFlush.resolve();
+      IOUtils.write = write;
+      IOUtils.remove = remove;
+      IOUtils.writeUTF8 = writeUTF8;
+      await stopping;
+      await replacement?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("rejects public admission finishing validation after shutdown and drains its durable gate", async function () {
+    const f = await fixture("", true);
+    const lookup = Zotero.Items.getByLibraryAndKeyAsync;
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let submitting: Promise<unknown> | undefined;
+    let stopping: Promise<void> | undefined;
+    let replacement: MineruTaskService | undefined;
+    try {
+      Zotero.Items.getByLibraryAndKeyAsync = async (...args) => {
+        if (args[1] === f.source.key) {
+          enter();
+          await blocked;
+        }
+        return lookup.apply(Zotero.Items, args);
+      };
+      submitting = f.service
+        .submit({ requestID: "late-validation", source: f.sourceID })
+        .then(
+          () => "acknowledged",
+          (error) => (error as MineruAPIError).code,
+        );
+      await entered;
+      let drained = false;
+      const shutdown = f.service.shutdown();
+      assert.strictEqual(
+        f.service.shutdown(),
+        shutdown,
+        "shutdown is idempotent",
+      );
+      stopping = Promise.resolve(shutdown).then(() => {
+        drained = true;
+      });
+      await f.service.status();
+      assert.isFalse(
+        drained,
+        "in-flight validation must drain before replacement",
+      );
+      release();
+      assert.equal(await submitting, "plugin_not_ready");
+      await stopping;
+      Zotero.Items.getByLibraryAndKeyAsync = lookup;
+      replacement = new MineruTaskService({ storageRoot: f.storageRoot });
+      await replacement.initialize();
+      assert.isEmpty(replacement.getQueue().pending);
+      await replacement.submit({
+        requestID: "replacement",
+        source: f.sourceID,
+      });
+      assert.lengthOf(replacement.getQueue().pending, 1);
+    } finally {
+      release();
+      Zotero.Items.getByLibraryAndKeyAsync = lookup;
+      await submitting;
+      await stopping;
+      await replacement?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("awaits initialization already in flight without reopening intake after shutdown", async function () {
+    const f = await fixture("", true);
+    await f.service.shutdown();
+    const read = IOUtils.readUTF8;
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const starting = new MineruTaskService({ storageRoot: f.storageRoot });
+    let initialization: Promise<void> | undefined,
+      stopping: Promise<void> | undefined;
+    try {
+      IOUtils.readUTF8 = async (path, ...args) => {
+        if (path === PathUtils.join(f.storageRoot, "queue.json")) {
+          enter();
+          await blocked;
+        }
+        return read.call(IOUtils, path, ...args);
+      };
+      initialization = starting.initialize();
+      await entered;
+      let drained = false;
+      stopping = starting.shutdown().then(() => {
+        drained = true;
+      });
+      await starting.status();
+      assert.isFalse(drained);
+      release();
+      await initialization;
+      await stopping;
+      assert.isFalse((await starting.status()).plugin.ready);
+      try {
+        await starting.submit({
+          requestID: "stopped-startup",
+          source: f.sourceID,
+        });
+        assert.fail("stopped initialization cannot admit work");
+      } catch (error) {
+        assert.equal((error as MineruAPIError).code, "plugin_not_ready");
+      }
+    } finally {
+      release();
+      IOUtils.readUTF8 = read;
+      await initialization;
+      await stopping;
+      await starting.shutdown();
+      await f.clean();
+    }
+  });
 
   it("publishes once, replays requests, reuses valid results, and retains superseded results", async function () {
     const f = await fixture();
@@ -220,7 +483,7 @@ describe("MinerU shared task service and local HTTP API", function () {
         ).taskID,
         forced.taskID,
       );
-      assert.equal(f.service.cancel(forced.taskID).state, "succeeded");
+      assert.equal((await f.service.cancel(forced.taskID)).state, "succeeded");
     } finally {
       await f.clean();
     }
@@ -314,7 +577,7 @@ describe("MinerU shared task service and local HTTP API", function () {
     const f = await fixture("sleep 1");
     const previous = new Map(
       Object.entries(Zotero.Server.Endpoints).filter(([path]) =>
-        path.startsWith(`${localAPIBase}/`),
+        path.startsWith(`/${config.addonRef}/`),
       ),
     );
     const unregister = registerLocalAPI(f.service);
@@ -325,18 +588,23 @@ describe("MinerU shared task service and local HTTP API", function () {
       route: string,
       body?: unknown,
       headers: Record<string, string> = {},
+      apiBase = localAPIBase,
     ) => {
       let response;
       try {
-        response = await Zotero.HTTP.request(method, `${base}/${route}`, {
-          headers: {
-            "Zotero-Allowed-Request": "1",
-            "Content-Type": "application/json",
-            ...headers,
+        response = await Zotero.HTTP.request(
+          method,
+          `${base.replace(localAPIBase, apiBase)}/${route}`,
+          {
+            headers: {
+              "Zotero-Allowed-Request": "1",
+              "Content-Type": "application/json",
+              ...headers,
+            },
+            body: body === undefined ? undefined : JSON.stringify(body),
+            successCodes: false,
           },
-          body: body === undefined ? undefined : JSON.stringify(body),
-          successCodes: false,
-        });
+        );
       } catch (error) {
         const failure = error as {
           status?: number;
@@ -358,7 +626,21 @@ describe("MinerU shared task service and local HTTP API", function () {
     };
     let taskID: string | undefined;
     try {
-      assert.equal((await http("GET", "status")).data.protocolVersion, 1);
+      assert.equal((await http("GET", "status")).data.protocolVersion, 2);
+      const legacy = `/${config.addonRef}/v1`;
+      for (const [method, route, payload] of [
+        ["GET", "tasks?taskID=old", undefined],
+        ["POST", "tasks", { requestID: "v1", source: f.sourceID }],
+        ["POST", "tasks/cancel", { taskID: "old" }],
+      ] as const) {
+        const response = await http(method, route, payload, {}, legacy);
+        assert.equal(response.status, 409);
+        assert.equal(response.data.error.code, "upgrade_required");
+      }
+      assert.equal(
+        (await http("GET", "status", undefined, {}, legacy)).status,
+        200,
+      );
       assert.equal(
         (await http("GET", "status")).data.userLibraryID,
         Zotero.Libraries.userLibraryID,
@@ -419,6 +701,51 @@ describe("MinerU shared task service and local HTTP API", function () {
       );
       assert.equal(found.status, 200);
       assert.equal(found.data.source.itemKey, f.source.key);
+      assert.equal((await http("POST", "queue/pause", {})).data.paused, true);
+      const batch = await http("POST", "batches", {
+        requestID: "http-batch",
+        items: [
+          { requestID: "http-batch-1", source: f.sourceID },
+          { requestID: "http-batch-2", source: f.sourceID },
+        ],
+      });
+      assert.equal(batch.status, 200);
+      const ids = batch.data.taskIDs;
+      assert.equal(
+        (await http("GET", `batches?batchID=${batch.data.batchID}`)).data.tasks
+          .length,
+        2,
+      );
+      const moved = await http("POST", "queue/move", {
+        taskID: ids[1],
+        before: ids[0],
+      });
+      assert.deepEqual(
+        moved.data.pending.map((task: TaskRecord) => task.taskID),
+        [ids[1], ids[0]],
+      );
+      assert.equal((await http("GET", "queue")).data.remainingCapacity, 8);
+      const cancelledBatch = await http("POST", "batches/cancel", {
+        batchID: batch.data.batchID,
+      });
+      assert.isTrue(
+        cancelledBatch.data.tasks.every(
+          (task: TaskRecord) => task.state === "cancelled",
+        ),
+      );
+      assert.equal((await http("POST", "queue/resume", {})).data.paused, false);
+      assert.equal(
+        (
+          await http(
+            "GET",
+            `results?libraryID=${f.source.libraryID}&itemKey=${f.source.key}`,
+            undefined,
+            {},
+            legacy,
+          )
+        ).status,
+        200,
+      );
       unregister();
       assert.equal((await http("GET", "status")).status, 404);
     } catch (error) {
@@ -431,7 +758,7 @@ describe("MinerU shared task service and local HTTP API", function () {
       throw error;
     } finally {
       if (taskID && f.service.busy) {
-        f.service.cancel(taskID);
+        await f.service.cancel(taskID);
         await terminal(f.service, taskID);
       }
       unregister();
@@ -441,50 +768,1419 @@ describe("MinerU shared task service and local HTTP API", function () {
     }
   });
 
-  it("joins matching active snapshots and keeps each request ID bound to its own inputs", async function () {
+  it("keeps distinct callers independent, queues FIFO, and replays only retained request identity", async function () {
     const f = await fixture("sleep 1");
-    let taskID: string | undefined;
     try {
       const original = await f.service.submit({
         requestID: "original",
         source: f.sourceID,
       });
-      taskID = original.taskID;
       const deadline = Date.now() + 10000;
-      while (f.service.get(taskID).phase !== "parsing" && Date.now() < deadline)
+      while (
+        f.service.get(original.taskID).phase !== "parsing" &&
+        Date.now() < deadline
+      )
         await Zotero.Promise.delay(10);
-      assert.equal(f.service.get(taskID).phase, "parsing");
+      assert.equal(f.service.get(original.taskID).phase, "parsing");
       const request = {
-        requestID: "alias",
+        requestID: "independent",
         source: f.sourceID,
         options: { tier: "standard" },
       };
-      const joined = await f.service.submit(request);
-      assert.equal(joined.taskID, taskID);
-      assert.equal(joined.disposition, "reused_task");
-      assert.equal((await f.service.submit(request)).taskID, taskID);
-      try {
-        await f.service.submit({
-          requestID: "different",
-          source: f.sourceID,
-          options: { ocr_mode: "ocr" },
-        });
-        assert.fail("Different inputs must not join an active task");
-      } catch (error) {
-        assert.instanceOf(error, MineruAPIError);
-        assert.equal((error as MineruAPIError).code, "task_busy");
-      }
-      const completed = await terminal(f.service, taskID);
-      assert.equal(completed.state, "succeeded");
+      const queued = await f.service.submit(request);
+      assert.notEqual(queued.taskID, original.taskID);
+      assert.equal(queued.state, "queued");
+      assert.equal((await f.service.submit(request)).taskID, queued.taskID);
+      await f.service.cancel(queued.taskID);
       assert.equal(
-        (await f.service.submit(request)).result!.itemKey,
-        completed.result!.itemKey,
+        f.service.get(original.taskID).state,
+        "running",
+        "cancelling queued work cannot signal another caller",
+      );
+      assert.equal(
+        (await terminal(f.service, original.taskID)).state,
+        "succeeded",
+      );
+      assert.equal(
+        (await f.service.submit(request)).state,
+        "cancelled",
+        "replay does not retry cancelled work",
+      );
+      const fresh = await f.service.submit({ ...request, requestID: "fresh" });
+      assert.equal(
+        (await terminal(f.service, fresh.taskID)).disposition,
+        "reused_result",
       );
     } finally {
-      if (taskID && f.service.busy) {
-        f.service.cancel(taskID);
-        await terminal(f.service, taskID);
+      await f.clean();
+    }
+  });
+
+  it("persists paused FIFO order, atomic capacity admission, batch errors and queued cancellation", async function () {
+    const f = await fixture("", true);
+    let recovered: MineruTaskService | undefined;
+    try {
+      const submitted = await Promise.all(
+        Array.from({ length: 10 }, (_, index) =>
+          f.service.submit({
+            requestID: `pending-${index}`,
+            source: f.sourceID,
+          }),
+        ),
+      );
+      assert.isTrue(f.service.getQueue().paused);
+      assert.isFalse(f.service.busy);
+      assert.equal(f.service.getQueue().remainingCapacity, 0);
+      const replay = await f.service.submit({
+        requestID: "pending-0",
+        source: f.sourceID,
+      });
+      assert.equal(replay.taskID, submitted[0].taskID);
+      try {
+        await f.service.submit({ requestID: "overflow", source: f.sourceID });
+        assert.fail("capacity must reject");
+      } catch (error) {
+        assert.equal((error as MineruAPIError).code, "queue_full");
       }
+      await f.service.move(submitted[9].taskID, {
+        before: submitted[0].taskID,
+      });
+      await f.service.cancel(submitted[3].taskID);
+      Zotero.Prefs.set(`${config.prefsPrefix}.queueLimit`, 2, true);
+      assert.equal(
+        f.service.getQueue().pending.length,
+        9,
+        "lowering cap does not evict work",
+      );
+      assert.equal(f.service.getQueue().remainingCapacity, 0);
+      await f.service.shutdown();
+      recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+      await recovered.initialize();
+      assert.isTrue(recovered.getQueue().paused);
+      assert.deepEqual(
+        recovered.getQueue().pending.map((task) => task.taskID),
+        [
+          submitted[9],
+          ...submitted
+            .slice(0, 9)
+            .filter((task) => task.taskID !== submitted[3].taskID),
+        ].map((task) => task.taskID),
+      );
+      assert.equal(
+        (await recovered.submit({ requestID: "pending-3", source: f.sourceID }))
+          .state,
+        "cancelled",
+      );
+      const ordered = recovered.getQueue().pending;
+      for (const task of ordered) await recovered.cancel(task.taskID);
+      const batch = await recovered.submitBatch({
+        requestID: "mixed",
+        items: [
+          {
+            requestID: "valid-1",
+            source: { libraryID: f.parent.libraryID, itemKey: f.parent.key },
+          },
+          {
+            requestID: "invalid-1",
+            source: { libraryID: f.source.libraryID, itemKey: "AAAAAAAA" },
+          },
+          { requestID: "valid-2", source: f.sourceID },
+        ],
+      });
+      assert.lengthOf(batch.tasks, 2);
+      assert.equal(batch.invalid[0].index, 1);
+      assert.equal(batch.invalid[0].error.code, "item_not_found");
+      const snapshot = await IOUtils.readUTF8(
+        PathUtils.join(f.storageRoot, "queue.json"),
+      );
+      assert.notInclude(
+        snapshot,
+        f.configPath,
+        "queue intent stores no configuration path snapshot",
+      );
+      const cancelled = await recovered.cancelBatch(batch.batchID);
+      assert.isTrue(
+        cancelled.tasks.every((task) => task.state === "cancelled"),
+      );
+      assert.deepEqual(recovered.getQueue().pending, []);
+    } finally {
+      await recovered?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("rejects the whole new valid batch subset when it cannot fit, without choosing among PDFs", async function () {
+    const f = await fixture("", true);
+    try {
+      Zotero.Prefs.set(`${config.prefsPrefix}.queueLimit`, 1, true);
+      try {
+        await f.service.submitBatch({
+          requestID: "too-large",
+          items: [
+            { requestID: "a", source: f.sourceID },
+            { requestID: "b", source: f.sourceID },
+            { requestID: "bad", source: {} },
+          ],
+        });
+        assert.fail("valid subset exceeds capacity");
+      } catch (error) {
+        assert.equal((error as MineruAPIError).code, "queue_full");
+        assert.equal((error as MineruAPIError).details.remainingCapacity, 1);
+        assert.lengthOf(
+          (error as MineruAPIError).details.invalid as unknown[],
+          1,
+        );
+      }
+      assert.isEmpty(f.service.getQueue().pending);
+      await Zotero.Attachments.importFromFile({
+        file: Zotero.File.pathToFile(
+          (await f.source.getFilePathAsync()) as string,
+        ),
+        parentItemID: f.parent.id,
+        contentType: "application/pdf",
+      });
+      const mixed = await f.service.submitBatch({
+        requestID: "ambiguous",
+        items: [
+          {
+            requestID: "ambiguous-parent",
+            source: { libraryID: f.parent.libraryID, itemKey: f.parent.key },
+          },
+          { requestID: "exact", source: f.sourceID },
+        ],
+      });
+      assert.lengthOf(mixed.tasks, 1);
+      assert.equal(mixed.invalid[0].error.code, "multiple_pdfs");
+      assert.deepEqual(
+        await f.service.submitBatch({
+          requestID: "ambiguous",
+          items: [
+            {
+              requestID: "ambiguous-parent",
+              source: { libraryID: f.parent.libraryID, itemKey: f.parent.key },
+            },
+            { requestID: "exact", source: f.sourceID },
+          ],
+        }),
+        mixed,
+      );
+    } finally {
+      await f.clean();
+    }
+  });
+
+  it("binds latest settings only at dequeue, keeps explicit overrides, and removes sensitive scratch before terminal", async function () {
+    const f = await fixture("", true);
+    try {
+      const inherited = await f.service.submit({
+        requestID: "inherit",
+        source: f.sourceID,
+      });
+      const explicit = await f.service.submit({
+        requestID: "explicit",
+        source: f.sourceID,
+        options: { image_analysis: true },
+      });
+      Zotero.Prefs.set(`${config.prefsPrefix}.imageAnalysis`, false, true);
+      await IOUtils.writeUTF8(
+        f.configPath,
+        "private_test_secret: do-not-store-me\n",
+      );
+      assert.equal(
+        (await f.service.submit({ requestID: "inherit", source: f.sourceID }))
+          .taskID,
+        inherited.taskID,
+      );
+      await f.service.resume();
+      const first = await terminal(f.service, inherited.taskID);
+      const second = await terminal(f.service, explicit.taskID);
+      assert.equal(first.state, "succeeded", JSON.stringify(first.error));
+      assert.isFalse(first.execution!.options.image_analysis);
+      assert.isTrue(second.execution!.options.image_analysis);
+      assert.equal(
+        first.execution!.configurationSha256,
+        await IOUtils.computeHexDigest(f.configPath, "sha256"),
+      );
+      const snapshot = await IOUtils.readUTF8(
+        PathUtils.join(f.storageRoot, "queue.json"),
+      );
+      assert.notInclude(snapshot, "do-not-store-me");
+      assert.notInclude(snapshot, "childEnvironment");
+      assert.isEmpty(
+        await IOUtils.getChildren(PathUtils.join(f.storageRoot, "scratch")),
+      );
+      assert.isTrue(
+        await IOUtils.exists(
+          PathUtils.join(
+            f.storageRoot,
+            "diagnostics",
+            first.taskID,
+            "stdout.log",
+          ),
+        ),
+      );
+    } finally {
+      await f.clean();
+    }
+  });
+
+  for (const fault of ["copy", "hash", "read"] as const) {
+    const title = `pauses the real queue on shared configuration ${fault} failure until repair and explicit resume`;
+
+    it(title, async function () {
+      const f = await fixture("", true);
+      const copy = IOUtils.copy,
+        hash = IOUtils.computeHexDigest,
+        read = IOUtils.readUTF8;
+      try {
+        const first = await f.service.submit({
+          requestID: "config-fault",
+          source: f.sourceID,
+        });
+        const next = await f.service.submit({
+          requestID: "after-config-repair",
+          source: f.sourceID,
+        });
+        IOUtils.copy = async (source, target, ...args) => {
+          if (fault === "copy" && source === f.configPath)
+            throw new Error(
+              "external config access fault: secret=never-persist",
+            );
+          return copy.call(IOUtils, source, target, ...args);
+        };
+        IOUtils.computeHexDigest = async (path, ...args) => {
+          if (fault === "hash" && path.endsWith("config.yaml"))
+            throw new Error("external config hash fault");
+          return hash.call(IOUtils, path, ...args);
+        };
+        IOUtils.readUTF8 = async (path, ...args) => {
+          if (fault === "read" && path.endsWith("config.yaml"))
+            throw new Error("external config read fault");
+          return read.call(IOUtils, path, ...args);
+        };
+        await f.service.resume();
+        const failed = await terminal(f.service, first.taskID);
+        assert.equal(failed.state, "failed");
+        assert.equal(failed.error!.category, "environment");
+        assert.isTrue(f.service.getQueue().paused);
+        assert.equal(f.service.get(next.taskID).state, "queued");
+        assert.isFalse(
+          await IOUtils.exists(PathUtils.join(f.dir.path, "calls")),
+        );
+        assert.notInclude(
+          await read.call(IOUtils, PathUtils.join(f.storageRoot, "queue.json")),
+          "never-persist",
+        );
+        IOUtils.copy = copy;
+        IOUtils.computeHexDigest = hash;
+        IOUtils.readUTF8 = read;
+        await IOUtils.writeUTF8(f.configPath, "# repaired latest config\n{}\n");
+        Zotero.Prefs.set(`${config.prefsPrefix}.imageAnalysis`, false, true);
+        assert.equal(
+          (
+            await f.service.submit({
+              requestID: "config-fault",
+              source: f.sourceID,
+            })
+          ).state,
+          "failed",
+        );
+        assert.equal(
+          f.service.get(next.taskID).state,
+          "queued",
+          "repair and replay do not resume or retry",
+        );
+        await f.service.resume();
+        const done = await terminal(f.service, next.taskID);
+        assert.equal(done.state, "succeeded");
+        assert.isFalse(done.execution!.options.image_analysis);
+        assert.equal(
+          done.execution!.configurationSha256,
+          await hash.call(IOUtils, f.configPath, "sha256"),
+        );
+        assert.equal(f.service.get(first.taskID).state, "failed");
+        assert.equal(
+          (
+            await read.call(IOUtils, PathUtils.join(f.dir.path, "calls"))
+          ).trim(),
+          "called",
+        );
+      } finally {
+        IOUtils.copy = copy;
+        IOUtils.computeHexDigest = hash;
+        IOUtils.readUTF8 = read;
+        await f.clean();
+      }
+    });
+  }
+
+  it("continues after a source-specific PDF copy access failure", async function () {
+    const f = await fixture("", true);
+    const copy = IOUtils.copy;
+    try {
+      const sourcePath = await f.source.getFilePathAsync();
+      const first = await f.service.submit({
+        requestID: "pdf-copy-fault",
+        source: f.sourceID,
+      });
+      const next = await f.service.submit({
+        requestID: "pdf-copy-next",
+        source: f.sourceID,
+      });
+      let failedOnce = false;
+      IOUtils.copy = async (source, target, ...args) => {
+        if (source === sourcePath && !failedOnce) {
+          failedOnce = true;
+          throw new Error("external PDF access fault");
+        }
+        return copy.call(IOUtils, source, target, ...args);
+      };
+      await f.service.resume();
+      assert.equal(
+        (await terminal(f.service, first.taskID)).error!.category,
+        "input",
+      );
+      assert.equal((await terminal(f.service, next.taskID)).state, "succeeded");
+      assert.isFalse(f.service.getQueue().paused);
+    } finally {
+      IOUtils.copy = copy;
+      await f.clean();
+    }
+  });
+
+  it("continues after an individual input failure but pauses after an observed shared runtime failure", async function () {
+    const f = await fixture("", true);
+    try {
+      const missing = await f.service.submit({
+        requestID: "missing-input",
+        source: f.sourceID,
+      });
+      const good = await f.service.submit({
+        requestID: "next-input",
+        source: f.sourceID,
+      });
+      // The first failure is a disappeared item, not an unavailable shared environment.
+      const other = await Zotero.Attachments.importFromFile({
+        file: Zotero.File.pathToFile(
+          (await f.source.getFilePathAsync()) as string,
+        ),
+        parentItemID: f.parent.id,
+        contentType: "application/pdf",
+      });
+      const third = await f.service.submit({
+        requestID: "good-other",
+        source: { libraryID: other.libraryID, itemKey: other.key },
+      });
+      await f.source.eraseTx();
+      await f.service.resume();
+      assert.equal((await terminal(f.service, missing.taskID)).state, "failed");
+      assert.equal((await terminal(f.service, good.taskID)).state, "failed");
+      assert.equal(
+        (await terminal(f.service, third.taskID)).state,
+        "succeeded",
+      );
+      await f.service.pause();
+      const badRuntime = await f.service.submit({
+        requestID: "runtime-fails",
+        source: { libraryID: other.libraryID, itemKey: other.key },
+      });
+      const pending = await f.service.submit({
+        requestID: "untouched",
+        source: { libraryID: other.libraryID, itemKey: other.key },
+      });
+      Zotero.Prefs.set(
+        `${config.prefsPrefix}.runtimeDescriptor`,
+        "/missing/runtime.json",
+        true,
+      );
+      await f.service.resume();
+      const failed = await terminal(f.service, badRuntime.taskID);
+      assert.equal(failed.state, "failed");
+      assert.equal(failed.error!.category, "environment");
+      assert.isTrue(f.service.getQueue().paused);
+      assert.equal(f.service.get(pending.taskID).state, "queued");
+    } finally {
+      await f.clean();
+    }
+  });
+
+  it("reconciles durable exact completion evidence and never certifies a forced task from historical matching results", async function () {
+    const f = await fixture();
+    let restarted: MineruTaskService | undefined;
+    try {
+      const first = await terminal(
+        f.service,
+        (await f.service.submit({ requestID: "complete", source: f.sourceID }))
+          .taskID,
+      );
+      await f.service.pause();
+      await f.service.shutdown();
+      const path = PathUtils.join(f.storageRoot, "queue.json");
+      const saved = JSON.parse(await IOUtils.readUTF8(path));
+      const entry = saved.entries.find(
+        (item: any) => item.record.taskID === first.taskID,
+      );
+      entry.record.state = "running";
+      delete entry.record.completedAt;
+      delete entry.record.result;
+      await IOUtils.writeUTF8(path, JSON.stringify(saved));
+      restarted = new MineruTaskService({ storageRoot: f.storageRoot });
+      await restarted.initialize();
+      assert.equal(restarted.get(first.taskID).state, "succeeded");
+      assert.equal(
+        restarted.get(first.taskID).result!.itemKey,
+        first.result!.itemKey,
+      );
+      const forced = await restarted.submit({
+        requestID: "unknown-forced",
+        source: f.sourceID,
+        force: true,
+      });
+      await restarted.shutdown();
+      const unknown = JSON.parse(await IOUtils.readUTF8(path));
+      const active = unknown.entries.find(
+        (item: any) => item.record.taskID === forced.taskID,
+      );
+      active.record.state = "running";
+      active.attemptID = crypto.randomUUID();
+      unknown.pending = unknown.pending.filter(
+        (id: string) => id !== forced.taskID,
+      );
+      await IOUtils.writeUTF8(path, JSON.stringify(unknown));
+      restarted = new MineruTaskService({ storageRoot: f.storageRoot });
+      await restarted.initialize();
+      assert.equal(restarted.get(forced.taskID).state, "interrupted");
+      assert.isTrue(restarted.getQueue().paused);
+      assert.equal(
+        (
+          await restarted.submit({
+            requestID: "unknown-forced",
+            source: f.sourceID,
+            force: true,
+          })
+        ).state,
+        "interrupted",
+      );
+      assert.equal(
+        (await restarted.results(f.sourceID)).results[0].itemKey,
+        first.result!.itemKey,
+      );
+    } finally {
+      await restarted?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("fails closed on corrupt storage and on an unacknowledged admission write", async function () {
+    const f = await fixture("", true);
+    const original = IOUtils.writeUTF8;
+    let broken: MineruTaskService | undefined;
+    try {
+      const path = PathUtils.join(f.storageRoot, "queue.json");
+      IOUtils.writeUTF8 = async (target, ...args) => {
+        if (target === path) throw new Error("external disk fault");
+        return original.call(IOUtils, target, ...args);
+      };
+      try {
+        await f.service.submit({
+          requestID: "unconfirmed",
+          source: f.sourceID,
+        });
+        assert.fail("write must fail");
+      } catch (error) {
+        assert.equal(
+          (error as MineruAPIError).code,
+          "queue_storage_unavailable",
+        );
+      }
+      assert.isEmpty(
+        f.service.getQueue().pending,
+        "candidate is not published before its durable commit",
+      );
+      assert.isFalse((await f.service.status()).storageReady);
+      IOUtils.writeUTF8 = original;
+      await f.service.shutdown();
+      await IOUtils.writeUTF8(path, "{corrupt");
+      broken = new MineruTaskService({ storageRoot: f.storageRoot });
+      try {
+        await broken.initialize();
+        assert.fail("corrupt state cannot silently reset");
+      } catch {
+        /* expected */
+      }
+      try {
+        await broken.submit({ requestID: "blocked", source: f.sourceID });
+        assert.fail("must remain blocked");
+      } catch (error) {
+        assert.equal(
+          (error as MineruAPIError).code,
+          "queue_storage_unavailable",
+        );
+      }
+      assert.equal(await IOUtils.readUTF8(path), "{corrupt");
+    } finally {
+      IOUtils.writeUTF8 = original;
+      await broken
+        ?.shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      await f.clean();
+    }
+  });
+
+  it("holds the serial slot through terminal notification and blocked cleanup, while durable late cancellation preserves committed success", async function () {
+    const f = await fixture("", true);
+    const original = IOUtils.remove;
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cleanup = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let notified = false;
+    try {
+      const first = await f.service.submit(
+        { requestID: "cleanup-first", source: f.sourceID, force: true },
+        (view) => {
+          if (view.state === "succeeded") notified = true;
+        },
+      );
+      const second = await f.service.submit({
+        requestID: "cleanup-next",
+        source: f.sourceID,
+        force: true,
+      });
+      IOUtils.remove = async (path, ...args) => {
+        if (
+          path.startsWith(
+            PathUtils.join(f.storageRoot, "scratch", first.taskID),
+          )
+        ) {
+          entered();
+          await blocked;
+        }
+        return original.call(IOUtils, path, ...args);
+      };
+      await f.service.resume();
+      await cleanup;
+      assert.isTrue(notified, "progress success precedes final cleanup");
+      assert.isTrue(f.service.busy);
+      assert.equal(
+        f.service.get(first.taskID).state,
+        "running",
+        "progress does not publish terminal durable state",
+      );
+      assert.equal(f.service.get(second.taskID).state, "queued");
+      await f.service.pause();
+      assert.equal(
+        (await f.service.cancel(first.taskID)).state,
+        "cancel_requested",
+      );
+      const saved = JSON.parse(
+        await IOUtils.readUTF8(PathUtils.join(f.storageRoot, "queue.json")),
+      );
+      assert.equal(
+        saved.entries.find((entry: any) => entry.record.taskID === first.taskID)
+          .record.state,
+        "cancel_requested",
+      );
+      release();
+      assert.equal(
+        (await terminal(f.service, first.taskID)).state,
+        "succeeded",
+      );
+      assert.equal(
+        f.service.get(second.taskID).state,
+        "queued",
+        "pause blocks only the next dispatch",
+      );
+      await f.service.resume();
+      assert.equal(
+        (await terminal(f.service, second.taskID)).state,
+        "succeeded",
+      );
+      assert.equal(
+        (await IOUtils.readUTF8(PathUtils.join(f.dir.path, "calls")))
+          .trim()
+          .split("\n").length,
+        2,
+      );
+    } finally {
+      release();
+      IOUtils.remove = original;
+      await f.clean();
+    }
+  });
+
+  for (const window of ["receipt", "terminal"] as const) {
+    const title = `recovers committed output across a failed ${window} queue flush without rerunning the forced task`;
+
+    it(title, async function () {
+      const f = await fixture("", true);
+      const original = IOUtils.writeUTF8;
+      const remove = IOUtils.remove;
+      let completion: PublicationCompletion | undefined;
+      let committed: Zotero.Item | undefined;
+      const removed: string[] = [];
+      let recovered: MineruTaskService | undefined;
+      try {
+        const first = await f.service.submit({
+          requestID: `crash-${window}`,
+          source: f.sourceID,
+          force: true,
+        });
+        const second = await f.service.submit({
+          requestID: "preserve-pending",
+          source: f.sourceID,
+        });
+        const path = PathUtils.join(f.storageRoot, "queue.json");
+        const journalRoot = PathUtils.join(
+          Zotero.DataDirectory.dir,
+          "mineru-publication-journal",
+        );
+        // Observe the real filesystem deletion, not a fake internal ACK. The
+        // queue snapshot must already contain the exact owner receipt on disk.
+        IOUtils.remove = async (target, ...args) => {
+          if (
+            PathUtils.parent(target) === journalRoot &&
+            target.endsWith(".json")
+          ) {
+            const journal = JSON.parse(await IOUtils.readUTF8(target));
+            assert.equal(journal.owner.taskID, first.taskID);
+            const durable = JSON.parse(
+              await IOUtils.readUTF8(path),
+            ).entries.find(
+              (entry: any) => entry.record.taskID === first.taskID,
+            );
+            assert.deepEqual(
+              durable.completion,
+              {
+                ...journal.owner,
+                token: journal.token,
+                result: {
+                  libraryID: journal.identity.libraryID,
+                  itemKey: journal.identity.key,
+                },
+              },
+              "journal deletion follows the real service's flushed exact completion",
+            );
+            assert.deepEqual(durable.completion, completion);
+            removed.push(journal.token);
+          }
+          return remove.call(IOUtils, target, ...args);
+        };
+        IOUtils.writeUTF8 = async (target, content, ...args) => {
+          if (target === path) {
+            const state = JSON.parse(content);
+            const entry = state.entries.find(
+              (entry: any) => entry.record.taskID === first.taskID,
+            );
+            if (entry.completion) {
+              completion ??= entry.completion;
+              assert.deepEqual(entry.completion, completion);
+              committed = await Zotero.Items.getByLibraryAndKeyAsync(
+                entry.completion.result.libraryID,
+                entry.completion.result.itemKey,
+              );
+              assert.exists(
+                committed,
+                "DB commit precedes the service's durable receipt write",
+              );
+            }
+            if (
+              window === "receipt"
+                ? !!entry.completion
+                : entry.record.state === "succeeded"
+            )
+              throw new Error("external crash-window disk failure");
+          }
+          return original.call(IOUtils, target, content, ...args);
+        };
+        await f.service.resume();
+        const deadline = Date.now() + 10000;
+        while (
+          ((await f.service.status()).storageReady || f.service.busy) &&
+          Date.now() < deadline
+        )
+          await Zotero.Promise.delay(10);
+        assert.isFalse((await f.service.status()).storageReady);
+        assert.equal(f.service.get(second.taskID).state, "queued");
+        assert.exists(completion);
+        assert.exists(committed);
+        assert.isTrue(
+          await committed!.fileExists(),
+          "failed queue flush never rolls back committed output",
+        );
+        assert.isTrue(await f.source.fileExists());
+        const journalPath = PathUtils.join(
+          journalRoot,
+          `${completion!.token}.json`,
+        );
+        const durable = JSON.parse(await IOUtils.readUTF8(path)).entries.find(
+          (entry: any) => entry.record.taskID === first.taskID,
+        );
+        assert.equal(completion!.taskID, first.taskID);
+        assert.equal(completion!.attemptID, durable.attemptID);
+        assert.deepEqual(completion!.result, {
+          libraryID: committed!.libraryID,
+          itemKey: committed!.key,
+        });
+        assert.equal(await IOUtils.exists(journalPath), window === "receipt");
+        if (window === "receipt") {
+          assert.isUndefined(
+            durable.completion,
+            "failed receipt flush is not durable evidence",
+          );
+          const journal = JSON.parse(await IOUtils.readUTF8(journalPath));
+          assert.equal(journal.version, 2);
+          assert.equal(journal.phase, "committed");
+          assert.deepEqual(journal.owner, {
+            taskID: first.taskID,
+            attemptID: completion!.attemptID,
+          });
+          assert.equal(journal.token, completion!.token);
+          assert.isEmpty(
+            removed,
+            "unacknowledged output retains its correlated journal",
+          );
+        } else {
+          assert.deepEqual(durable.completion, completion);
+          assert.deepEqual(removed, [completion!.token]);
+        }
+        IOUtils.writeUTF8 = original;
+        try {
+          await f.service.shutdown();
+          assert.fail("failed terminal flush must reject shutdown");
+        } catch (error) {
+          assert.instanceOf(error, AggregateError);
+        }
+        recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+        await recovered.initialize();
+        assert.equal(recovered.get(first.taskID).state, "succeeded");
+        assert.equal(
+          recovered.get(first.taskID).result!.itemKey,
+          committed!.key,
+        );
+        assert.isFalse(await IOUtils.exists(journalPath));
+        assert.deepEqual(removed, [completion!.token]);
+        const reconciled = JSON.parse(
+          await IOUtils.readUTF8(path),
+        ).entries.find((entry: any) => entry.record.taskID === first.taskID);
+        assert.deepEqual(reconciled.completion, completion);
+        assert.isTrue(recovered.getQueue().paused);
+        assert.equal(recovered.get(second.taskID).state, "queued");
+        assert.equal(
+          (await IOUtils.readUTF8(PathUtils.join(f.dir.path, "calls"))).trim(),
+          "called",
+          "restart never launches a forced rerun",
+        );
+        assert.lengthOf((await recovered.results(f.sourceID)).results, 1);
+      } finally {
+        IOUtils.writeUTF8 = original;
+        IOUtils.remove = remove;
+        await recovered?.shutdown();
+        await f.clean();
+      }
+    });
+  }
+
+  for (const category of ["process", "validation"] as const) {
+    const title = `continues after a settled individual ${category} failure`;
+
+    it(title, async function () {
+      const f = await fixture("", true);
+      try {
+        // A stable marker outside per-attempt sensitive scratch lets the next real child succeed.
+        await IOUtils.writeUTF8(
+          PathUtils.join(f.dir.path, "bin", "mineru-kit"),
+          `#!/bin/sh\nif [ ! -f '${f.dir.path}/failed-once' ]; then touch '${f.dir.path}/failed-once'; exit ${category === "process" ? 7 : 0}; fi\ncp '${f.dir.path}/result.zip' "$4"\n`,
+        );
+        const first = await f.service.submit({
+          requestID: "fails-once",
+          source: f.sourceID,
+          force: true,
+        });
+        const next = await f.service.submit({
+          requestID: "after-failure",
+          source: f.sourceID,
+          force: true,
+        });
+        await f.service.resume();
+        const failed = await terminal(f.service, first.taskID);
+        assert.equal(failed.state, "failed");
+        assert.equal(failed.error!.category, category);
+        assert.equal(
+          (await terminal(f.service, next.taskID)).state,
+          "succeeded",
+        );
+        assert.isFalse(f.service.getQueue().paused);
+      } finally {
+        await f.clean();
+      }
+    });
+  }
+
+  it("blocks dispatch on owned verification ZIP cleanup failure and recovers it before resuming without deleting source or results", async function () {
+    const f = await fixture("", true);
+    const remove = IOUtils.remove;
+    const root = PathUtils.join(
+      Zotero.DataDirectory.dir,
+      "mineru-publication-journal",
+    );
+    const owned = new Set<string>();
+    let recovered: MineruTaskService | undefined;
+    try {
+      const prior = await f.service.submit({
+        requestID: "prior-result",
+        source: f.sourceID,
+      });
+      await f.service.resume();
+      const published = await terminal(f.service, prior.taskID);
+      assert.equal(published.state, "succeeded");
+      await f.service.pause();
+      const first = await f.service.submit({
+        requestID: "verification-cleanup-fault",
+        source: f.sourceID,
+        force: true,
+      });
+      const next = await f.service.submit({
+        requestID: "verification-next",
+        source: f.sourceID,
+        force: true,
+      });
+      IOUtils.remove = async (path, ...args) => {
+        if (PathUtils.parent(path) === root && path.endsWith(".zip")) {
+          owned.add(path);
+          throw new Error("external verification archive removal fault");
+        }
+        return remove.call(IOUtils, path, ...args);
+      };
+      await f.service.resume();
+      const failed = await terminal(f.service, first.taskID);
+      assert.equal(failed.state, "failed");
+      assert.equal(failed.error!.category, "recovery");
+      assert.isTrue(f.service.getQueue().paused);
+      assert.isFalse((await f.service.status()).recoveryReady);
+      assert.equal(f.service.get(next.taskID).state, "queued");
+      const journals = (await IOUtils.getChildren(root)).filter((path) =>
+        path.endsWith(".json"),
+      );
+      assert.lengthOf(journals, 1, "cleanup failure retains recovery evidence");
+      const journal = JSON.parse(await IOUtils.readUTF8(journals[0]));
+      assert.equal(journal.owner.taskID, first.taskID);
+      const archive = PathUtils.join(root, `${journal.token}.zip`);
+      assert.isTrue(owned.has(archive));
+      assert.isTrue(await IOUtils.exists(archive));
+      assert.isTrue(
+        await IOUtils.exists(
+          PathUtils.join(
+            Zotero.getStorageDirectory().path,
+            `tmp-mineru-${journal.token}`,
+          ),
+        ),
+      );
+      IOUtils.remove = remove;
+      await f.service.shutdown();
+      // A crash can also leave an archive without its JSON journal.
+      const orphan = PathUtils.join(root, `${crypto.randomUUID()}.zip`);
+      owned.add(orphan);
+      await IOUtils.copy(PathUtils.join(f.dir.path, "result.zip"), orphan);
+      recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+      await recovered.initialize();
+      for (const path of owned) assert.isFalse(await IOUtils.exists(path));
+      assert.isFalse(await IOUtils.exists(journals[0]));
+      assert.isTrue((await recovered.status()).recoveryReady);
+      assert.isTrue(recovered.getQueue().paused);
+      assert.equal(recovered.get(next.taskID).state, "queued");
+      assert.equal(
+        recovered.get(first.taskID).state,
+        "failed",
+        "recovery never retries the failed task",
+      );
+      assert.isTrue(await f.source.fileExists());
+      assert.equal(
+        (await recovered.results(f.sourceID)).results.find(
+          (item) => item.itemKey === published.result!.itemKey,
+        )!.availability,
+        "valid",
+      );
+      await recovered.resume();
+      assert.equal((await terminal(recovered, next.taskID)).state, "succeeded");
+      assert.equal(
+        (await IOUtils.readUTF8(PathUtils.join(f.dir.path, "calls")))
+          .trim()
+          .split("\n").length,
+        3,
+      );
+    } finally {
+      IOUtils.remove = remove;
+      await recovered?.shutdown();
+      await f.service.shutdown();
+      // Failure cleanup only touches exact archives observed at the external seam.
+      for (const path of owned) {
+        assert.equal(PathUtils.parent(path), root);
+        await remove.call(IOUtils, path, { ignoreAbsent: true });
+      }
+      // A failed assertion must not strand the real journal for later test modules.
+      if (!recovered && !(await f.service.status()).recoveryReady) {
+        recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+        await recovered.initialize();
+        await recovered.shutdown();
+      }
+      await f.clean();
+    }
+  });
+
+  it("fails startup closed on orphan verification ZIP cleanup errors and leaves unrecognized files untouched", async function () {
+    const f = await fixture("", true);
+    await f.service.shutdown();
+    const root = PathUtils.join(
+      Zotero.DataDirectory.dir,
+      "mineru-publication-journal",
+    );
+    await IOUtils.makeDirectory(root, { ignoreExisting: true });
+    const orphan = PathUtils.join(root, `${crypto.randomUUID()}.zip`);
+    const unknown = PathUtils.join(root, "user-original.zip");
+    const unsupported = PathUtils.join(root, `${"-".repeat(36)}.zip`);
+    const remove = IOUtils.remove;
+    let starting = new MineruTaskService({ storageRoot: f.storageRoot });
+    try {
+      await IOUtils.copy(PathUtils.join(f.dir.path, "result.zip"), orphan);
+      await IOUtils.writeUTF8(unknown, "user archive");
+      await IOUtils.writeUTF8(unsupported, "unsupported token");
+      IOUtils.remove = async (path, ...args) => {
+        if (path === orphan)
+          throw new Error("external orphan archive removal fault");
+        return remove.call(IOUtils, path, ...args);
+      };
+      try {
+        await starting.initialize();
+        assert.fail("orphan cleanup must block readiness");
+      } catch (error) {
+        assert.match(String(error), /Publication recovery incomplete/);
+      }
+      assert.isFalse((await starting.status()).recoveryReady);
+      assert.isTrue(await IOUtils.exists(orphan));
+      try {
+        await starting.resume();
+        assert.fail("cleanup uncertainty blocks dispatch");
+      } catch (error) {
+        assert.equal((error as MineruAPIError).code, "recovery_required");
+      }
+      await starting
+        .shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      IOUtils.remove = remove;
+      starting = new MineruTaskService({ storageRoot: f.storageRoot });
+      await starting.initialize();
+      assert.isFalse(await IOUtils.exists(orphan));
+      assert.equal(await IOUtils.readUTF8(unknown), "user archive");
+      assert.equal(await IOUtils.readUTF8(unsupported), "unsupported token");
+      assert.isTrue(await f.source.fileExists());
+    } finally {
+      IOUtils.remove = remove;
+      await starting
+        .shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      for (const path of [orphan, unknown, unsupported]) {
+        assert.equal(PathUtils.parent(path), root);
+        await remove.call(IOUtils, path, { ignoreAbsent: true });
+      }
+      await f.clean();
+    }
+  });
+
+  it("refuses an escaped verification archive path from the filesystem without touching the external file", async function () {
+    const f = await fixture("", true);
+    await f.service.shutdown();
+    const root = PathUtils.join(
+      Zotero.DataDirectory.dir,
+      "mineru-publication-journal",
+    );
+    await IOUtils.makeDirectory(root, { ignoreExisting: true });
+    const external = PathUtils.join(f.dir.path, `${crypto.randomUUID()}.zip`);
+    await IOUtils.writeUTF8(external, "not plugin owned");
+    const children = IOUtils.getChildren;
+    const starting = new MineruTaskService({ storageRoot: f.storageRoot });
+    try {
+      IOUtils.getChildren = async (path, ...args) =>
+        path === root ? [external] : children.call(IOUtils, path, ...args);
+      try {
+        await starting.initialize();
+        assert.fail("escaped cleanup path must block recovery");
+      } catch (error) {
+        assert.match(String(error), /Publication recovery incomplete/);
+      }
+      assert.isFalse((await starting.status()).recoveryReady);
+      assert.equal(await IOUtils.readUTF8(external), "not plugin owned");
+      assert.isTrue(await f.source.fileExists());
+    } finally {
+      IOUtils.getChildren = children;
+      await starting
+        .shutdown()
+        .catch((error) => assert.instanceOf(error, AggregateError));
+      await f.clean();
+    }
+  });
+
+  it("pauses on sensitive cleanup failure, retains committed success, and retries owned orphan cleanup at startup", async function () {
+    const f = await fixture("", true);
+    const original = IOUtils.remove;
+    let recovered: MineruTaskService | undefined;
+    try {
+      const first = await f.service.submit({
+        requestID: "cleanup-failure",
+        source: f.sourceID,
+        force: true,
+      });
+      const next = await f.service.submit({
+        requestID: "blocked-next",
+        source: f.sourceID,
+      });
+      IOUtils.remove = async (path, ...args) => {
+        if (
+          path.startsWith(
+            PathUtils.join(f.storageRoot, "scratch", first.taskID),
+          )
+        )
+          throw new Error("external scratch removal fault");
+        return original.call(IOUtils, path, ...args);
+      };
+      await f.service.resume();
+      const done = await terminal(f.service, first.taskID);
+      assert.equal(
+        done.state,
+        "succeeded",
+        "saved attachment cannot become failed/cancelled after commit",
+      );
+      assert.equal(done.error!.category, "cleanup");
+      assert.isTrue(f.service.getQueue().paused);
+      assert.isFalse((await f.service.status()).recoveryReady);
+      assert.equal(f.service.get(next.taskID).state, "queued");
+      IOUtils.remove = original;
+      try {
+        await f.service.shutdown();
+        assert.fail("uncertain cleanup must reject shutdown");
+      } catch (error) {
+        assert.instanceOf(error, AggregateError);
+      }
+      recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+      await recovered.initialize();
+      assert.isEmpty(
+        await IOUtils.getChildren(PathUtils.join(f.storageRoot, "scratch")),
+      );
+      assert.isTrue((await recovered.status()).recoveryReady);
+      assert.equal(recovered.get(first.taskID).state, "succeeded");
+      assert.equal(recovered.get(next.taskID).state, "queued");
+    } finally {
+      IOUtils.remove = original;
+      await recovered?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("persists active batch cancellation before signalling its actual child, without aborting unrelated queued work", async function () {
+    const f = await fixture("exec sleep 10", true);
+    const original = IOUtils.writeUTF8;
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    try {
+      const batch = await f.service.submitBatch({
+        requestID: "cancel-active-batch",
+        items: [
+          { requestID: "active-member", source: f.sourceID },
+          { requestID: "queued-member", source: f.sourceID },
+        ],
+      });
+      const unrelated = await f.service.submit({
+        requestID: "unrelated",
+        source: f.sourceID,
+      });
+      await f.service.resume();
+      const deadline = Date.now() + 10000;
+      while (
+        !(await IOUtils.exists(PathUtils.join(f.dir.path, "calls"))) &&
+        Date.now() < deadline
+      )
+        await Zotero.Promise.delay(10);
+      assert.equal(f.service.get(batch.taskIDs[0]).phase, "parsing");
+      await f.service.pause();
+      const path = PathUtils.join(f.storageRoot, "queue.json");
+      IOUtils.writeUTF8 = async (target, content, ...args) => {
+        if (
+          target === path &&
+          JSON.parse(content).entries.some(
+            (entry: any) => entry.record.state === "cancel_requested",
+          )
+        ) {
+          entered();
+          await blocked;
+        }
+        return original.call(IOUtils, target, content, ...args);
+      };
+      const cancelling = f.service.cancelBatch(batch.batchID);
+      await writing;
+      assert.equal(
+        f.service.get(batch.taskIDs[0]).state,
+        "running",
+        "candidate cancellation is not published before flush",
+      );
+      assert.equal(f.service.get(batch.taskIDs[1]).state, "queued");
+      assert.isTrue(f.service.busy);
+      release();
+      await cancelling;
+      assert.equal(
+        (await terminal(f.service, batch.taskIDs[0])).state,
+        "cancelled",
+      );
+      assert.equal(f.service.get(batch.taskIDs[1]).state, "cancelled");
+      assert.equal(f.service.get(unrelated.taskID).state, "queued");
+      IOUtils.writeUTF8 = original;
+      await IOUtils.writeUTF8(
+        PathUtils.join(f.dir.path, "bin", "mineru-kit"),
+        `#!/bin/sh\ncp '${f.dir.path}/result.zip' "$4"\n`,
+      );
+      await f.service.resume();
+      assert.equal(
+        (await terminal(f.service, unrelated.taskID)).state,
+        "succeeded",
+      );
+    } finally {
+      release();
+      IOUtils.writeUTF8 = original;
+      await f.clean();
+    }
+  });
+
+  it("executes restart-restored pending intent using current preferences while retaining replay identity", async function () {
+    const f = await fixture("", true);
+    let recovered: MineruTaskService | undefined;
+    try {
+      const request = { requestID: "restart-late", source: f.sourceID };
+      const queued = await f.service.submit(request);
+      await f.service.shutdown();
+      Zotero.Prefs.set(`${config.prefsPrefix}.imageAnalysis`, false, true);
+      recovered = new MineruTaskService({ storageRoot: f.storageRoot });
+      await recovered.initialize();
+      assert.equal((await recovered.submit(request)).taskID, queued.taskID);
+      assert.isTrue(recovered.getQueue().paused);
+      await recovered.resume();
+      const done = await terminal(recovered, queued.taskID);
+      assert.equal(done.state, "succeeded");
+      assert.isFalse(done.execution!.options.image_analysis);
+      Zotero.Prefs.set(`${config.prefsPrefix}.imageAnalysis`, true, true);
+      assert.isFalse(
+        (await recovered.submit(request)).execution!.options.image_analysis,
+        "replay never refreshes a completed execution",
+      );
+    } finally {
+      await recovered?.shutdown();
+      await f.clean();
+    }
+  });
+
+  it("bounds terminal history and batch manifests, expires replay registrations, and preserves unfinished work", async function () {
+    const f = await fixture();
+    try {
+      const publishedRequest = {
+        requestID: "history-result",
+        source: f.sourceID,
+      };
+      const published = await terminal(
+        f.service,
+        (await f.service.submit(publishedRequest)).taskID,
+      );
+      assert.equal(
+        published.state,
+        "succeeded",
+        JSON.stringify(published.error),
+      );
+      await f.service.pause();
+      const sourcePath = (await f.source.getFilePathAsync()) as string;
+      const sourceContents = await IOUtils.readUTF8(sourcePath);
+      const resultPath = published.result!.paths.markdown!;
+      const resultContents = await IOUtils.readUTF8(resultPath);
+
+      const requests = new Map([[published.taskID, publishedRequest]]);
+      const diagnostics = (taskID: string) =>
+        PathUtils.join(f.storageRoot, "diagnostics", taskID);
+      const seedDiagnostics = async (taskID: string) => {
+        await IOUtils.makeDirectory(diagnostics(taskID), {
+          createAncestors: true,
+        });
+        await IOUtils.writeUTF8(
+          PathUtils.join(diagnostics(taskID), "retention-fixture.log"),
+          "raw diagnostic fixture",
+        );
+      };
+      await seedDiagnostics(published.taskID);
+      const owning = await f.service.submitBatch({
+        requestID: "unfinished-owner",
+        items: [{ requestID: "unfinished", source: f.sourceID }],
+      });
+      const unfinished = owning.tasks[0];
+      const completed = [];
+      for (let index = 0; index < 100; index++) {
+        // Cancel the first pair together to allow equal completion timestamps.
+        // Neither public retention nor queue ordering specifies a tie victim.
+        const items = (
+          index === 0
+            ? ["history-task-0", "history-task-pair"]
+            : [`history-task-${index}`]
+        ).map((requestID) => ({ requestID, source: f.sourceID }));
+        const batch = await f.service.submitBatch({
+          requestID: `history-${index}`,
+          items,
+        });
+        for (const [itemIndex, taskID] of batch.taskIDs.entries()) {
+          requests.set(taskID, items[itemIndex]);
+          await seedDiagnostics(taskID);
+        }
+        await f.service.cancelBatch(batch.batchID);
+        completed.push(batch);
+      }
+      // A replay-only wrapper counts toward the separate manifest bound without
+      // adding another terminal task that would force both early pair members out.
+      const wrapper = await f.service.submitBatch({
+        requestID: "history-wrapper",
+        items: [requests.get(completed.at(-1)!.taskIDs[0])!],
+      });
+      assert.deepEqual(wrapper.taskIDs, completed.at(-1)!.taskIDs);
+      completed.push(wrapper);
+      const recent = f.service.getQueue().recent;
+      assert.lengthOf(recent, 100);
+      const retained = new Set(recent.map((task) => task.taskID));
+      const evicted = [...requests.keys()].filter((id) => !retained.has(id));
+      assert.lengthOf(evicted, requests.size - 100);
+      assert.include(
+        evicted,
+        published.taskID,
+        "exercise successful-task history eviction before checking its attachment",
+      );
+      // Cancellation acknowledges the durable mutation and its diagnostic cleanup;
+      // no separate timer or cleanup grace period is part of this contract.
+      for (const taskID of requests.keys()) {
+        if (retained.has(taskID)) {
+          assert.include(
+            ["succeeded", "cancelled"],
+            f.service.get(taskID).state,
+          );
+          assert.equal(
+            await IOUtils.readUTF8(
+              PathUtils.join(diagnostics(taskID), "retention-fixture.log"),
+            ),
+            "raw diagnostic fixture",
+            `retained task keeps diagnostics: ${taskID}`,
+          );
+        } else {
+          assert.propertyVal(
+            assert.throws(() => f.service.get(taskID), MineruAPIError),
+            "code",
+            "task_not_found",
+          );
+          assert.isFalse(
+            await IOUtils.exists(diagnostics(taskID)),
+            `evicted task loses diagnostics: ${taskID}`,
+          );
+        }
+      }
+      assert.equal(f.service.get(unfinished.taskID).state, "queued");
+      assert.deepEqual(
+        f.service.getQueue().pending.map((task) => task.taskID),
+        owning.taskIDs,
+      );
+      assert.equal(
+        f.service.getBatch(owning.batchID).tasks[0].state,
+        "queued",
+        "owning unfinished manifests outlive bounded wrappers",
+      );
+      assert.propertyVal(
+        assert.throws(
+          () => f.service.getBatch(completed[0].batchID),
+          MineruAPIError,
+        ),
+        "code",
+        "batch_not_found",
+      );
+      for (const batch of completed.slice(-100))
+        assert.equal(f.service.getBatch(batch.batchID).batchID, batch.batchID);
+
+      const expiredID = evicted.find((id) => id !== published.taskID)!;
+      const fresh = await f.service.submit(requests.get(expiredID)!);
+      assert.notEqual(
+        fresh.taskID,
+        expiredID,
+        "eviction expires task replay registration",
+      );
+      assert.equal(fresh.state, "queued");
+      // Index every retained task, not a predicted oldest tie member. Observe which
+      // member actually expires on the next terminal-history eviction.
+      const indexed = await f.service.submitBatch({
+        requestID: "partial",
+        items: recent.map((task) => requests.get(task.taskID)!),
+      });
+      assert.sameMembers(indexed.taskIDs, [...retained]);
+      assert.isFalse(indexed.partialHistory);
+      await f.service.cancel(fresh.taskID);
+      const remaining = new Set(
+        f.service.getQueue().recent.map((task) => task.taskID),
+      );
+      assert.equal(remaining.size, 100);
+      const expiredMembers = indexed.taskIDs.filter((id) => !remaining.has(id));
+      assert.lengthOf(expiredMembers, 1);
+      const partial = f.service.getBatch(indexed.batchID);
+      assert.isTrue(partial.partialHistory);
+      assert.sameMembers(partial.expiredTaskIDs, expiredMembers);
+      assert.sameMembers(
+        partial.tasks.map((task) => task.taskID),
+        indexed.taskIDs.filter((id) => remaining.has(id)),
+      );
+      for (const taskID of expiredMembers) {
+        assert.propertyVal(
+          assert.throws(() => f.service.get(taskID), MineruAPIError),
+          "code",
+          "task_not_found",
+        );
+        assert.isFalse(await IOUtils.exists(diagnostics(taskID)));
+      }
+
+      const source = await Zotero.Items.getByLibraryAndKeyAsync(
+        f.source.libraryID,
+        f.source.key,
+      );
+      assert.isOk(
+        source,
+        "history eviction preserves the source attachment item",
+      );
+      assert.isFalse(source.deleted);
+      assert.equal(await source.getFilePathAsync(), sourcePath);
+      assert.equal(await IOUtils.readUTF8(sourcePath), sourceContents);
+      const result = await Zotero.Items.getByLibraryAndKeyAsync(
+        published.result!.libraryID,
+        published.result!.itemKey,
+      );
+      assert.isOk(
+        result,
+        "history eviction preserves the published attachment item",
+      );
+      assert.isFalse(result.deleted);
+      assert.equal(await result.getFilePathAsync(), resultPath);
+      assert.equal(await IOUtils.readUTF8(resultPath), resultContents);
+      const found = await f.service.results(f.sourceID);
+      assert.equal(
+        found.results.find(
+          (item) => item.itemKey === published.result!.itemKey,
+        )!.availability,
+        "valid",
+      );
+    } finally {
       await f.clean();
     }
   });

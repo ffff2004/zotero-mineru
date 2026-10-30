@@ -31,7 +31,7 @@ describe("MinerU Preferences", function () {
     previousToolkit = globals.ztoolkit;
     globals.addon = Zotero[config.addonInstance];
     globals.ztoolkit = (Zotero[config.addonInstance] as any).data.ztoolkit;
-    for (const key of ["runtimeDescriptor", "configPath"]) {
+    for (const key of ["runtimeDescriptor", "configPath", "queueLimit"]) {
       saved.set(key, Zotero.Prefs.get(`${config.prefsPrefix}.${key}`, true));
     }
     for (const key of ["MINERU_CONFIG", "MINERU_HOME"])
@@ -99,7 +99,15 @@ describe("MinerU Preferences", function () {
     )!;
     await waitFor(() => win.document.readyState === "complete");
     const doc = win.document;
-    for (const id of ["runtime", "config", "tier", "ocr", "images", "pages"]) {
+    for (const id of [
+      "runtime",
+      "config",
+      "tier",
+      "ocr",
+      "images",
+      "pages",
+      "queue-limit",
+    ]) {
       const input = doc.createElementNS(
         "http://www.w3.org/1999/xhtml",
         "input",
@@ -108,6 +116,7 @@ describe("MinerU Preferences", function () {
       doc.documentElement.append(input);
     }
     for (const id of [
+      "queue-limit-error",
       "config-effective",
       "runtime-status",
       "runtime-check",
@@ -139,6 +148,54 @@ describe("MinerU Preferences", function () {
     globals.addon = previousAddon;
     globals.ztoolkit = previousToolkit;
     await IOUtils.remove(root, { recursive: true });
+  });
+
+  it("validates queueLimit through the public Preferences load/change events without overwriting valid capacity", async function () {
+    const key = `${config.prefsPrefix}.queueLimit`;
+    Zotero.Prefs.clear(key, true);
+    assert.equal(Zotero.Prefs.get(key, true), 10, "shipped default");
+    await (Zotero[config.addonInstance] as any).hooks.onPrefsEvent("load", {
+      window: win,
+    });
+    const control = win.document.getElementById(
+      "mineru-queue-limit",
+    ) as HTMLInputElement;
+    const error = win.document.getElementById("mineru-queue-limit-error")!;
+    assert.equal(control.value, "10");
+    for (const invalid of [
+      "",
+      "0",
+      "-1",
+      "1.5",
+      "NaN",
+      "2147483648",
+      "4294967296",
+      "9007199254740991",
+      "9007199254740992",
+      "1e2",
+    ]) {
+      control.value = invalid;
+      control.dispatchEvent(new win.Event("change"));
+      assert.equal(Zotero.Prefs.get(key, true), 10);
+      assert.equal(control.getAttribute("aria-invalid"), "true");
+      assert.isNotEmpty(error.textContent);
+    }
+    for (const valid of ["1", "2147483647"]) {
+      control.value = valid;
+      control.dispatchEvent(new win.Event("change"));
+      assert.equal(
+        Zotero.Prefs.get(key, true),
+        Number(valid),
+        "native preference round-trips the boundary exactly",
+      );
+      assert.isEmpty(error.textContent);
+      assert.equal(control.getAttribute("aria-invalid"), "false");
+    }
+    control.value = "3";
+    control.dispatchEvent(new win.Event("change"));
+    assert.equal(Zotero.Prefs.get(key, true), 3);
+    assert.isEmpty(error.textContent);
+    assert.equal(control.getAttribute("aria-invalid"), "false");
   });
 
   it("uses the same named-user, home, relative and inherited paths as task freezing", async function () {
