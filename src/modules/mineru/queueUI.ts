@@ -160,7 +160,7 @@ export function openQueueWindow(): Window {
             task.source.libraryID === Zotero.Libraries.userLibraryID
               ? "library"
               : `groups/${Zotero.Groups.getGroupIDFromLibraryID(task.source.libraryID)}`;
-          sourceLink.href = `zotero://open-pdf/${libraryPath}/items/${task.source.itemKey}`;
+          sourceLink.href = `zotero://select/${libraryPath}/items/${task.source.itemKey}`;
           actions.set(sourceLink.id, async () => {
             const item = await Zotero.Items.getByLibraryAndKeyAsync(
               task.source.libraryID,
@@ -175,7 +175,7 @@ export function openQueueWindow(): Window {
             )
               throw new Error(getString("queue-source-unavailable"));
             if (disposed) return;
-            await Zotero.Reader.open(item.id);
+            await Zotero.getMainWindow().ZoteroPane.selectItem(item.id);
           });
           label.append(
             sourceLink,

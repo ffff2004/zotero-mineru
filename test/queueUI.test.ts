@@ -114,7 +114,7 @@ describe("MinerU queue window", function () {
     assert.equal(link.textContent, `${title} — ${pdf.libraryID}/${pdf.key}`);
     assert.equal(
       link.getAttribute("href"),
-      `zotero://open-pdf/library/items/${pdf.key}`,
+      `zotero://select/library/items/${pdf.key}`,
       "source URI targets the exact attachment, not its parent or a sibling",
     );
   };
@@ -170,6 +170,7 @@ describe("MinerU queue window", function () {
         );
         assertSource(task.taskID, identity, identity.key);
       }
+      await main.ZoteroPane.selectItem(sibling.id);
       await withReaderSpy(async (opened) => {
         sourceLink(task.taskID).click();
         // Assert the en-US user-visible message, not a source-module locale
@@ -183,6 +184,11 @@ describe("MinerU queue window", function () {
           "missing source is reported in the queue's visible error region",
         );
         assert.isEmpty(opened, "never opens the missing PDF or its sibling");
+        assert.deepEqual(
+          main.ZoteroPane.getSelectedItems().map((item) => item.id),
+          [sibling.id],
+          "an unavailable source leaves the main-pane selection unchanged",
+        );
         assert.equal(service.getTask(task.taskID).source.itemKey, identity.key);
         assert.equal(service.getTask(task.taskID).state, "queued");
         assert.isTrue(await sibling.fileExists());
@@ -196,6 +202,9 @@ describe("MinerU queue window", function () {
         }
       });
     } finally {
+      // Native parent/child deletion notifications can remove adjacent tree rows
+      // when a selected child has expanded the disposable parent.
+      await main.ZoteroPane.itemsView.collapseAllRows();
       await paper.eraseTx();
     }
   };
@@ -382,7 +391,7 @@ describe("MinerU queue window", function () {
     }
   });
 
-  it("labels a child PDF with its bibliographic parent title and opens that exact attachment after row replacement", async function () {
+  it("labels a child PDF with its bibliographic parent title and selects that exact attachment after row replacement", async function () {
     const paper = new Zotero.Item("journalArticle");
     paper.setField("title", "Queue source <paper> & citation");
     await paper.saveTx();
@@ -395,16 +404,30 @@ describe("MinerU queue window", function () {
       assert.notEqual(pdf.id, sibling.id);
       assert.isNull(sourceLink(task.taskID).querySelector("paper"));
       await withReaderSpy(async (opened) => {
+        await main.ZoteroPane.selectItem(sibling.id);
         const originalLink = sourceLink(task.taskID);
         originalLink.click();
-        await waitFor(() => opened.length === 1);
-        assert.deepEqual(opened, [pdf.id]);
+        await waitFor(
+          () => main.ZoteroPane.getSelectedItems()[0]?.id === pdf.id,
+        );
+        assert.deepEqual(
+          main.ZoteroPane.getSelectedItems().map((item) => item.id),
+          [pdf.id],
+          "selects the exact source child, not its parent or sibling",
+        );
         await waitFor(() => sourceLink(task.taskID) !== originalLink);
+        await main.ZoteroPane.selectItem(sibling.id);
         sourceLink(task.taskID).click();
-        await waitFor(() => opened.length === 2);
-        assert.deepEqual(opened, [pdf.id, pdf.id]);
+        await waitFor(
+          () => main.ZoteroPane.getSelectedItems()[0]?.id === pdf.id,
+        );
+        assert.isEmpty(opened, "source links select without opening a reader");
+        assert.equal(service.getTask(task.taskID).state, "queued");
       });
     } finally {
+      // Native parent/child deletion notifications can remove adjacent tree rows
+      // when a selected child has expanded the disposable parent.
+      await main.ZoteroPane.itemsView.collapseAllRows();
       await paper.eraseTx();
     }
   });
@@ -440,6 +463,9 @@ describe("MinerU queue window", function () {
       await openQueueFor(task.taskID);
       assertSource(task.taskID, pdf, "Full text PDF");
     } finally {
+      // Native parent/child deletion notifications can remove adjacent tree rows
+      // when a selected child has expanded the disposable parent.
+      await main.ZoteroPane.itemsView.collapseAllRows();
       await paper.eraseTx();
     }
   });
