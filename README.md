@@ -1,6 +1,6 @@
 # Zotero MinerU
 
-Zotero MinerU turns a selected PDF into a stored Markdown attachment. The result keeps `markdown.md`, `middle_json.json`, exported images and auxiliary JSON, and a small `provenance.json` together in one Zotero storage directory. The source PDF is never changed. Repeating a run reuses a complete result with matching source bytes, options, runtime and configuration; changed inputs create another attachment and retain earlier results.
+Zotero MinerU turns a selected PDF into a stored Markdown attachment. The result keeps Markdown named after the input PDF (for example, `paper.pdf` → `paper.md`), `middle_json.json`, exported images and auxiliary JSON, and a small `provenance.json` together in one Zotero storage directory. The source PDF is never changed. At startup, the plugin renames eligible legacy `markdown.md` attachments in your personal library using the current filename of the linked source PDF. Group results and any files that cannot be safely renamed keep their existing names. Repeating a run reuses a complete result with matching source bytes, options, runtime and configuration; changed inputs create another attachment and retain earlier results.
 
 The companion release targets Linux x86_64, Zotero 10, Python 3.13.12, MinerU 4.0.10 and DocVortex 0.5.7. The installer provides CPU and NVIDIA dependency profiles; NVIDIA use also needs a compatible driver. Intel iGPU acceleration is not supported by this release.
 

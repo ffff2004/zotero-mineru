@@ -1,6 +1,7 @@
 /** Validate the locked MinerU/DocVortex ZIP export before publication. */
 import Ajv2020 from "ajv/dist/2020.js";
 import middleSchema from "./middle-json.schema.json";
+import { EXPORT_MARKDOWN, isMarkdownFilename } from "./markdownFilename";
 import pkg from "../../../package.json";
 import { freezeParseEnvironment, type RuntimeSnapshot } from "./runtime";
 
@@ -12,13 +13,13 @@ export type ParseOptions = {
 };
 
 const ROOT_FILES = new Set([
-  "markdown.md",
+  EXPORT_MARKDOWN,
   "middle_json.json",
   "structured_content.json",
   "model_output.json",
   "provenance.json",
 ]);
-const REQUIRED = ["markdown.md", "middle_json.json"];
+const REQUIRED = [EXPORT_MARKDOWN, "middle_json.json"];
 const MAX_ZIP_BYTES = 1024 * 1024 * 1024;
 const MAX_ENTRY_BYTES = 256 * 1024 * 1024;
 const MAX_ENTRIES = 10000;
@@ -429,14 +430,17 @@ export async function extractValidatedPackage(
 /** Recheck an on-disk bundle using the same content checks as fresh exports. */
 export async function validatePublishedPackage(
   directory: string,
+  mainFile = EXPORT_MARKDOWN,
 ): Promise<void> {
+  if (!isMarkdownFilename(mainFile))
+    throw new Error("Invalid Markdown filename");
   const files = await actualFiles(directory);
-  for (const name of REQUIRED) {
+  for (const name of [mainFile, "middle_json.json"]) {
     if (!files.includes(name))
       throw new Error(`Missing required file: ${name}`);
   }
   const markdown = utf8.decode(
-    await IOUtils.read(PathUtils.join(directory, "markdown.md")),
+    await IOUtils.read(PathUtils.join(directory, mainFile)),
   );
   const middle = JSON.parse(
     utf8.decode(

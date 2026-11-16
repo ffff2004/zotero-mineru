@@ -28,6 +28,8 @@ import {
   type ItemIdentity,
 } from "./apiError";
 import type { ParseOptions } from "./package";
+import { migrateLegacyMarkdown } from "./markdownMigration";
+import { EXPORT_MARKDOWN, isMarkdownFilename } from "./markdownFilename";
 import { QueueStorage } from "./queueStorage";
 
 export type TaskRecord = {
@@ -359,11 +361,36 @@ export class MineruTaskService {
       await recoverIncompletePublications((completion) =>
         this.acknowledge(completion),
       );
+      await migrateLegacyMarkdown().catch((error) =>
+        Zotero.logError(error as Error),
+      );
       await this.cleanOrphans();
       this.recoveryReady = true;
       await this.mutate(async (candidate) => {
         candidate.paused = true;
         for (const entry of candidate.entries) {
+          const result = entry.record.result;
+          const oldPath = result?.paths.markdown;
+          if (
+            result &&
+            oldPath &&
+            result.libraryID === Zotero.Libraries.userLibraryID &&
+            PathUtils.filename(oldPath) === EXPORT_MARKDOWN
+          ) {
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(
+              result.libraryID,
+              result.itemKey,
+            );
+            const path = item && (await item.getFilePathAsync());
+            if (
+              path &&
+              path !== oldPath &&
+              PathUtils.parent(path) === PathUtils.parent(oldPath) &&
+              isMarkdownFilename(PathUtils.filename(path))
+            ) {
+              result.paths.markdown = path;
+            }
+          }
           if (!["running", "cancel_requested"].includes(entry.record.state))
             continue;
           // No running child survives this plugin instance. Clear only known owned paths.

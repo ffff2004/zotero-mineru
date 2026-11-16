@@ -221,6 +221,11 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(candidate["bbox"], [0.6, 0.1, 0.9, 0.4])
         self.assertFalse(found["verified"])
 
+    def test_markdown_line_lookup_accepts_pdf_based_bundle_filename(self):
+        (self.bundle / "markdown.md").rename(self.bundle / "paper.v2.md")
+        found = helper.locate(self.bundle, line=1)
+        self.assertEqual(found["candidates"][0]["page_idx"], 1)
+
     def test_repeated_caption_retains_both_table_regions(self):
         self.middle["pages"][1]["blocks"][0]["continues_prev"] = False
         self.write_bundle()
