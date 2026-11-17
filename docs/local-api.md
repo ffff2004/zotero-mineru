@@ -34,6 +34,9 @@ that exact PDF by the plugin note marker and `dc:relation`, and contain:
 - `paths.markdown`, `paths.middle`, `paths.provenance` (null if unavailable);
 - `issues`: usability limitations.
 
+Read the Markdown filename from `paths.markdown`. Legacy results may still use
+`markdown.md`; a saved absolute path may change after migration.
+
 `valid` means a structurally usable bundle matching the current PDF hash, not
 accurate OCR or a match for every reading task. `stale` means changed PDF bytes;
 `partial` retains Markdown but lacks usable sidecars/assets/source verification;

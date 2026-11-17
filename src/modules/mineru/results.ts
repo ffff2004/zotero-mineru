@@ -1,5 +1,10 @@
 /** Resolve exact PDF identities and inspect their published attachment bundles. */
 import { validatePublishedPackage, type ParseOptions } from "./package";
+import {
+  GENERATION_MARKER,
+  LEGACY_GENERATION_MARKER,
+  isMarkdownFilename,
+} from "./markdownFilename";
 import type { TaskSnapshot } from "./task";
 import {
   identity,
@@ -96,7 +101,7 @@ export async function inspectResult(
     issues: [],
   };
   const main = await item.getFilePathAsync();
-  if (!main || PathUtils.filename(main) !== "markdown.md") {
+  if (!main || !isMarkdownFilename(PathUtils.filename(main))) {
     result.issues.push("markdown_missing");
     return result;
   }
@@ -120,7 +125,7 @@ export async function inspectResult(
     if (result.paths.middle) {
       // Reuse the export validator, including Markdown-only assets and ordered
       // fixed-layout blocks, rather than maintaining a weaker second validator.
-      await validatePublishedPackage(root);
+      await validatePublishedPackage(root, PathUtils.filename(main));
     }
     if (result.paths.provenance) {
       const provenance = JSON.parse(
@@ -193,7 +198,9 @@ export async function findResults(
       item.isAttachment() &&
       item.isStoredFileAttachment() &&
       item.attachmentContentType === "text/markdown" &&
-      item.getNote().includes("zotero-mineru-generation:v1") &&
+      [GENERATION_MARKER, LEGACY_GENERATION_MARKER].some((marker) =>
+        item.getNote().includes(marker),
+      ) &&
       item.getRelationsByPredicate("dc:relation").includes(sourceURI)
     )
       results.push(await inspectResult(item, description.sha256));

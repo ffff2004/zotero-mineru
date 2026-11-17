@@ -1,7 +1,13 @@
 /** Zotero 10.0.3 stored-attachment publication for a previously validated package. */
 
-const MAIN_FILE = "markdown.md";
-const SENTINEL = "zotero-mineru-generation:v1";
+import {
+  EXPORT_MARKDOWN,
+  GENERATION_MARKER,
+  LEGACY_GENERATION_MARKER,
+  isMarkdownFilename,
+  matchesGenerationMarker,
+  markdownFilename,
+} from "./markdownFilename";
 const JOURNAL_DIR = "mineru-publication-journal";
 const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -23,6 +29,7 @@ type Journal = {
   token: string;
   phase: "staging" | "publishing" | "committed";
   package: PackageRecord;
+  mainFile?: string; // Absent in journals created before PDF-based filenames.
   identity?: Identity;
 };
 
@@ -43,6 +50,8 @@ export type PublicationRequest = {
   packageDirectory: string;
   /** The exact PDF attachment selected for this parse. */
   sourcePDF: Zotero.Item;
+  /** Filename of the PDF that was snapshotted, before any later Zotero rename. */
+  sourceFilename?: string;
   /** Optional display title. The default is local creation time with UTC offset. */
   title?: string;
   /** Prevent a new publication after plugin shutdown. */
@@ -185,7 +194,10 @@ function assertName(name: string): void {
   }
 }
 
-async function describeTree(root: string): Promise<PackageRecord> {
+async function describeTree(
+  root: string,
+  mainFile: string,
+): Promise<PackageRecord> {
   const files: FileRecord[] = [];
   const directories: string[] = [];
   const walk = async (directory: string, prefix: string): Promise<void> => {
@@ -218,7 +230,7 @@ async function describeTree(root: string): Promise<PackageRecord> {
   files.sort((a, b) => a.path.localeCompare(b.path));
   directories.sort();
   if (
-    ![MAIN_FILE, "middle_json.json", "provenance.json"].every((name) =>
+    ![mainFile, "middle_json.json", "provenance.json"].every((name) =>
       files.some((file) => file.path === name),
     )
   ) {
@@ -239,8 +251,9 @@ function samePackage(a: PackageRecord, b: PackageRecord): boolean {
 async function assertPackage(
   root: string,
   expected: PackageRecord,
+  mainFile: string,
 ): Promise<void> {
-  if (!samePackage(await describeTree(root), expected)) {
+  if (!samePackage(await describeTree(root, mainFile), expected)) {
     throw new Error(
       "Published attachment file tree differs from the validated package",
     );
@@ -251,6 +264,7 @@ async function copyPackage(
   source: string,
   target: string,
   record: PackageRecord,
+  mainFile: string,
 ): Promise<void> {
   await IOUtils.makeDirectory(target, { permissions: 0o755 });
   for (const directory of record.directories) {
@@ -260,12 +274,13 @@ async function copyPackage(
   }
   for (const file of record.files) {
     const parts = file.path.split("/");
-    await IOUtils.copy(pathFor(source, ...parts), pathFor(target, ...parts), {
+    const input = file.path === mainFile ? [EXPORT_MARKDOWN] : parts;
+    await IOUtils.copy(pathFor(source, ...input), pathFor(target, ...parts), {
       noOverwrite: true,
     });
     await Zotero.File.setNormalFilePermissions(pathFor(target, ...parts));
   }
-  await assertPackage(target, record);
+  await assertPackage(target, record, mainFile);
 }
 
 /** Verify the exact file names Zotero's recursive ZIP exporter will upload. */
@@ -358,17 +373,24 @@ async function currentSource(source: Zotero.Item): Promise<{
   };
 }
 
-function identityMatches(item: Zotero.Item, identity: Identity): boolean {
+function identityMatches(
+  item: Zotero.Item,
+  identity: Identity,
+  mainFile?: string,
+): boolean {
   return (
     item.id === identity.id &&
     item.key === identity.key &&
     item.libraryID === identity.libraryID &&
     item.dateAdded === identity.dateAdded &&
     item.isStoredFileAttachment() &&
-    item.attachmentPath === `storage:${MAIN_FILE}` &&
+    item.attachmentPath === `storage:${mainFile ?? EXPORT_MARKDOWN}` &&
     item.attachmentContentType === "text/markdown" &&
     item.getField("title") === identity.title &&
-    item.note === SENTINEL &&
+    matchesGenerationMarker(
+      item.note,
+      mainFile === undefined ? LEGACY_GENERATION_MARKER : GENERATION_MARKER,
+    ) &&
     item.getRelationsByPredicate("dc:relation").length === 1 &&
     item.hasRelation("dc:relation", identity.sourceURI) &&
     (item.parentItemID || false) === identity.parentID &&
@@ -400,9 +422,11 @@ async function verifyCommitted(
   requireUpload: boolean,
 ): Promise<boolean> {
   const identity = journal.identity;
-  if (!identity || !identityMatches(item, identity)) return false;
+  const mainFile = journal.mainFile ?? EXPORT_MARKDOWN;
+  if (!identity || !identityMatches(item, identity, journal.mainFile))
+    return false;
   if (!(await IOUtils.exists(finalPath(identity.key)))) return false;
-  const current = await describeTree(finalPath(identity.key));
+  const current = await describeTree(finalPath(identity.key), mainFile);
   if (!samePackage(current, journal.package)) return false;
   // Once Zotero sync has run, a completed attachment may be in_sync. Recovery
   // must keep it even when it is no longer queued for upload.
@@ -492,7 +516,7 @@ async function recoverOne(
     identity.key,
   );
   if (item) {
-    if (!identityMatches(item, identity)) {
+    if (!identityMatches(item, identity, journal.mainFile)) {
       throw new Error(
         `Recovery identity mismatch for new attachment ${identity.key}`,
       );
@@ -579,6 +603,9 @@ export async function recoverIncompletePublications(
             (!journal.owner ||
               !/^[0-9a-f-]{36}$/.test(journal.owner.taskID) ||
               !/^[0-9a-f-]{36}$/.test(journal.owner.attemptID))) ||
+          (journal.mainFile !== undefined &&
+            (typeof journal.mainFile !== "string" ||
+              !isMarkdownFilename(journal.mainFile))) ||
           journalPath(journal.token) !== path ||
           !["staging", "publishing", "committed"].includes(journal.phase)
         ) {
@@ -607,8 +634,30 @@ export async function publishValidatedPackage(
   let journal: Journal | undefined;
   try {
     if (request.signal?.aborted) throw new Error("MinerU task stopped");
-    const packageRecord = await describeTree(request.packageDirectory);
-    await currentSource(request.sourcePDF);
+    const sourceSnapshot = await currentSource(request.sourcePDF);
+    const mainFile = markdownFilename(
+      request.sourceFilename ?? sourceSnapshot.item.attachmentFilename,
+    );
+    const packageRecord = await describeTree(
+      request.packageDirectory,
+      EXPORT_MARKDOWN,
+    );
+    if (
+      mainFile !== EXPORT_MARKDOWN &&
+      [
+        ...packageRecord.files.map((file) => file.path),
+        ...packageRecord.directories,
+      ].some(
+        (path) =>
+          path.toLowerCase() === mainFile.toLowerCase() &&
+          path !== EXPORT_MARKDOWN,
+      )
+    ) {
+      throw new Error("Markdown filename collides with another package entry");
+    }
+    packageRecord.files.find((file) => file.path === EXPORT_MARKDOWN)!.path =
+      mainFile;
+    packageRecord.files.sort((a, b) => a.path.localeCompare(b.path));
     const token = crypto.randomUUID();
     journal = {
       version: request.owner ? 2 : 1,
@@ -616,12 +665,14 @@ export async function publishValidatedPackage(
       token,
       phase: "staging",
       package: packageRecord,
+      mainFile,
     };
     await saveJournal(journal);
     await copyPackage(
       request.packageDirectory,
       stagePath(token),
       packageRecord,
+      mainFile,
     );
     await assertZipContents(stagePath(token), packageRecord, token);
 
@@ -637,9 +688,9 @@ export async function publishValidatedPackage(
       item.setField("title", title);
       item.attachmentLinkMode = Zotero.Attachments.LINK_MODE_IMPORTED_FILE;
       item.attachmentContentType = "text/markdown";
-      item.attachmentPath = `storage:${MAIN_FILE}`;
+      item.attachmentPath = `storage:${mainFile}`;
       item.attachmentSyncState = "to_upload";
-      item.setNote(SENTINEL);
+      item.setNote(GENERATION_MARKER);
       item.addRelation("dc:relation", source.sourceURI);
       await item.save({ skipSelect: true });
       const dest = finalPath(item.key);
@@ -658,9 +709,9 @@ export async function publishValidatedPackage(
       };
       await saveJournal(journal!);
       await IOUtils.move(stagePath(token), dest, { noOverwrite: true });
-      await assertPackage(dest, packageRecord);
+      await assertPackage(dest, packageRecord, mainFile);
       if (
-        !identityMatches(item, journal!.identity) ||
+        !identityMatches(item, journal!.identity, mainFile) ||
         !(await uploadEligible(item))
       ) {
         throw new Error(

@@ -407,6 +407,58 @@ describe("MinerU shared task service and local HTTP API", function () {
     }
   });
 
+  it("preserves the result key and refreshes history after a legacy rename", async function () {
+    const f = await fixture();
+    let restarted: MineruTaskService | undefined;
+    try {
+      assert.isTrue(await f.source.renameAttachmentFile("markdown.pdf"));
+      const task = await terminal(
+        f.service,
+        (
+          await f.service.submit({
+            requestID: "legacy-path",
+            source: f.sourceID,
+          })
+        ).taskID,
+      );
+      assert.equal(task.state, "succeeded", JSON.stringify(task.error));
+      assert.equal(
+        PathUtils.filename(task.result!.paths.markdown!),
+        "markdown.md",
+      );
+      const result = await Zotero.Items.getByLibraryAndKeyAsync(
+        task.result!.libraryID,
+        task.result!.itemKey,
+      );
+      assert.isOk(result);
+      if (!result) throw new Error("Missing legacy fixture result");
+      result.setNote("zotero-mineru-generation:v1");
+      await result.saveTx({ skipNotifier: true });
+      const oldPDF = (await f.source.getFilePathAsync()) as string;
+      await IOUtils.move(
+        oldPDF,
+        PathUtils.join(PathUtils.parent(oldPDF)!, "current.pdf"),
+      );
+      f.source.attachmentFilename = "current.pdf";
+      await f.source.saveTx({ skipNotifier: true });
+
+      await f.service.shutdown();
+      restarted = new MineruTaskService({ storageRoot: f.storageRoot });
+      await restarted.initialize();
+
+      const saved = restarted.get(task.taskID).result!;
+      assert.equal(saved.itemKey, task.result!.itemKey);
+      assert.equal(PathUtils.filename(saved.paths.markdown!), "current.md");
+      assert.isTrue(await IOUtils.exists(saved.paths.markdown!));
+      const { results } = await restarted.results(f.sourceID);
+      assert.equal(results[0].paths.markdown, saved.paths.markdown);
+      assert.equal(results[0].availability, "valid");
+    } finally {
+      await restarted?.shutdown();
+      await f.clean();
+    }
+  });
+
   it("publishes once, replays requests, reuses valid results, and retains superseded results", async function () {
     const f = await fixture();
     try {

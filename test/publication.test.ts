@@ -28,7 +28,7 @@ describe("MinerU stored attachment publication", function () {
   it("publishes and locally restores the complete multifile package", async function () {
     const temp = temporaryDirectory();
     const pdf = temp.clone();
-    pdf.append("source.pdf");
+    pdf.append("论文.v2.PDF");
     await Zotero.File.putContentsAsync(pdf, "%PDF-1.4\n%%EOF\n");
     const source = await Zotero.Attachments.importFromFile({
       file: pdf,
@@ -73,9 +73,9 @@ describe("MinerU stored attachment publication", function () {
 
       assert.notEqual(result.id, source.id);
       assert.equal(result.attachmentContentType, "text/markdown");
-      assert.equal(result.attachmentPath, "storage:markdown.md");
+      assert.equal(result.attachmentPath, "storage:论文.v2.md");
       assert.deepEqual(result.getCollections(), [collection.id]);
-      assert.equal(result.note, "zotero-mineru-generation:v1");
+      assert.equal(result.note, "zotero-mineru-generation:v2");
       assert.deepEqual(result.getRelationsByPredicate("dc:relation"), [
         Zotero.URI.getItemURI(source),
       ]);
@@ -86,7 +86,7 @@ describe("MinerU stored attachment publication", function () {
       assert.include(uploadIDs, result.id);
       const storage = Zotero.Attachments.getStorageDirectory(result);
       for (const path of [
-        "markdown.md",
+        "论文.v2.md",
         "middle_json.json",
         "provenance.json",
         "images/x.png",

@@ -302,6 +302,7 @@ export class MineruTaskController {
           acknowledgeCompletion: lifecycle.acknowledgeCompletion,
           packageDirectory: parsed.packageDirectory,
           sourcePDF: source,
+          sourceFilename: PathUtils.filename(path),
           signal: abort.signal,
           onRecovery: (event) => {
             if (!publicationErrorReported) {

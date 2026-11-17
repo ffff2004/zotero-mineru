@@ -352,8 +352,12 @@ def batch_submission(manifest, request_id=None):
 def bundle_files(path):
     path = Path(path).resolve()
     if path.is_dir():
+        markdown = [
+            file for file in path.iterdir()
+            if file.is_file() and file.suffix.lower() == ".md"
+        ]
         return {
-            "markdown": path / "markdown.md",
+            "markdown": markdown[0] if len(markdown) == 1 else None,
             "middle": path / "middle_json.json",
             "provenance": path / "provenance.json",
         }, None
@@ -478,6 +482,11 @@ def locate(bundle, query=None, line=None, context=2):
     if query:
         clues.append(("query", query))
     if line is not None:
+        if not files.get("markdown"):
+            raise Failure(
+                "markdown_unavailable",
+                "Expected one Markdown file in the bundle; pass result/task JSON to specify its path",
+            )
         lines = files["markdown"].read_text(encoding="utf-8").splitlines()
         if not 1 <= line <= len(lines):
             raise Failure("invalid_line", "Markdown line is outside the document")
