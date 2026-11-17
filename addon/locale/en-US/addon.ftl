@@ -63,3 +63,11 @@ log-event-complete = Complete
 log-event-error = Exception
 log-event-success = Success
 log-event-failure = Failure
+
+migration-confirm = Rename { $count } existing Markdown attachment(s)? { $skipped } will be skipped.
+migration-sync-confirm = Sync both computers first and run this on only one. After renaming, sync this computer and wait for its attachments to finish uploading before syncing the other.
+migration-blocked = Migration stopped because sync is running or an eligible result or its PDF has pending sync changes. Finish syncing and resolve any conflicts, then try again.
+migration-empty = No Markdown attachments to rename. Skipped: { $skipped }.
+migration-result = Renamed: { $renamed }. Skipped: { $skipped }.
+migration-failed = Migration could not finish. Check the Zotero error log before retrying.
+migration-upload = Sync this computer and wait for the attachment uploads to finish.

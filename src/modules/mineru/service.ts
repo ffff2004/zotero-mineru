@@ -28,7 +28,11 @@ import {
   type ItemIdentity,
 } from "./apiError";
 import type { ParseOptions } from "./package";
-import { migrateLegacyMarkdown } from "./markdownMigration";
+import {
+  migrateLegacyMarkdown,
+  recoverLegacyMarkdownRename,
+  type MarkdownMigrationPreview,
+} from "./markdownMigration";
 import { EXPORT_MARKDOWN, isMarkdownFilename } from "./markdownFilename";
 import { QueueStorage } from "./queueStorage";
 
@@ -361,36 +365,15 @@ export class MineruTaskService {
       await recoverIncompletePublications((completion) =>
         this.acknowledge(completion),
       );
-      await migrateLegacyMarkdown().catch((error) =>
+      await recoverLegacyMarkdownRename().catch((error) =>
         Zotero.logError(error as Error),
       );
       await this.cleanOrphans();
       this.recoveryReady = true;
       await this.mutate(async (candidate) => {
         candidate.paused = true;
+        await this.refreshLegacyResultPaths(candidate);
         for (const entry of candidate.entries) {
-          const result = entry.record.result;
-          const oldPath = result?.paths.markdown;
-          if (
-            result &&
-            oldPath &&
-            result.libraryID === Zotero.Libraries.userLibraryID &&
-            PathUtils.filename(oldPath) === EXPORT_MARKDOWN
-          ) {
-            const item = await Zotero.Items.getByLibraryAndKeyAsync(
-              result.libraryID,
-              result.itemKey,
-            );
-            const path = item && (await item.getFilePathAsync());
-            if (
-              path &&
-              path !== oldPath &&
-              PathUtils.parent(path) === PathUtils.parent(oldPath) &&
-              isMarkdownFilename(PathUtils.filename(path))
-            ) {
-              result.paths.markdown = path;
-            }
-          }
           if (!["running", "cancel_requested"].includes(entry.record.state))
             continue;
           // No running child survives this plugin instance. Clear only known owned paths.
@@ -614,6 +597,40 @@ export class MineruTaskService {
       busy: this.busy,
       paused: this.state.paused,
     };
+  }
+  private async refreshLegacyResultPaths(state: State): Promise<void> {
+    for (const entry of state.entries) {
+      const result = entry.record.result;
+      const oldPath = result?.paths.markdown;
+      if (
+        result &&
+        oldPath &&
+        result.libraryID === Zotero.Libraries.userLibraryID &&
+        PathUtils.filename(oldPath) === EXPORT_MARKDOWN
+      ) {
+        const item = await Zotero.Items.getByLibraryAndKeyAsync(
+          result.libraryID,
+          result.itemKey,
+        );
+        const path = item && (await item.getFilePathAsync());
+        if (
+          path &&
+          path !== oldPath &&
+          PathUtils.parent(path) === PathUtils.parent(oldPath) &&
+          isMarkdownFilename(PathUtils.filename(path))
+        ) {
+          result.paths.markdown = path;
+        }
+      }
+    }
+  }
+  async migrateMarkdown(preview: MarkdownMigrationPreview) {
+    this.requireReady();
+    return this.mutate(async (candidate) => {
+      const result = await migrateLegacyMarkdown(preview);
+      if (result.renamed) await this.refreshLegacyResultPaths(candidate);
+      return result;
+    }, true);
   }
   async results(source: unknown) {
     if (!this.ready)

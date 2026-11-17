@@ -63,3 +63,11 @@ log-event-complete = 完成
 log-event-error = 异常
 log-event-success = 成功
 log-event-failure = 失败
+
+migration-confirm = 要重命名 { $count } 个已有的 Markdown 附件吗？将跳过 { $skipped } 个。
+migration-sync-confirm = 请先在两台电脑上完成同步，然后只在其中一台执行迁移。改名后先同步这台电脑，等附件上传完成，再同步另一台。
+migration-blocked = 迁移已停止：同步正在进行，或待迁移的结果及其 PDF 有未同步的更改。请先完成同步并解决冲突，再重试。
+migration-empty = 没有需要重命名的 Markdown 附件。已跳过 { $skipped } 个。
+migration-result = 已重命名 { $renamed } 个，已跳过 { $skipped } 个。
+migration-failed = 迁移未能完成。请先检查 Zotero 错误日志再重试。
+migration-upload = 请同步这台电脑，并等待附件上传完成。

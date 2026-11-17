@@ -35,7 +35,7 @@ that exact PDF by the plugin note marker and `dc:relation`, and contain:
 - `issues`: usability limitations.
 
 Read the Markdown filename from `paths.markdown`. Legacy results may still use
-`markdown.md`; a saved absolute path may change after migration.
+`markdown.md`; a saved absolute path may change after manual migration in the plugin settings.
 
 `valid` means a structurally usable bundle matching the current PDF hash, not
 accurate OCR or a match for every reading task. `stale` means changed PDF bytes;

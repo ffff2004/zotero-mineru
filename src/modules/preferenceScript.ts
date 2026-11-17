@@ -8,6 +8,10 @@ import {
   companionReleaseID,
 } from "./mineru/runtime";
 import { safeDiagnostic } from "./mineru/pluginLog";
+import { previewLegacyMarkdownMigration } from "./mineru/markdownMigration";
+import { mineruService } from "./mineru/service";
+
+let migrationInProgress = false;
 
 function openFile(win: Window, path: string): void {
   let available = false;
@@ -110,6 +114,50 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
       void fn();
     });
   };
+  const migrationButton = doc.getElementById("mineru-migrate-markdown");
+  const migrationStatus = doc.getElementById("mineru-migration-status");
+  button("migrate-markdown", async () => {
+    if (!migrationButton || !migrationStatus || migrationInProgress) return;
+    migrationInProgress = true;
+    migrationButton.setAttribute("disabled", "true");
+    migrationStatus.textContent = "";
+    try {
+      const preview = await previewLegacyMarkdownMigration();
+      if (preview.blocked) {
+        migrationStatus.textContent = getString("migration-blocked");
+        return;
+      }
+      if (!preview.candidates.length) {
+        migrationStatus.textContent = getString("migration-empty", {
+          args: { skipped: preview.skipped },
+        });
+        return;
+      }
+      const confirmation = getString("migration-confirm", {
+        args: { count: preview.candidates.length, skipped: preview.skipped },
+      });
+      const message = preview.sync.data
+        ? `${confirmation}\n\n${getString("migration-sync-confirm")}`
+        : confirmation;
+      if (!win.confirm(message)) return;
+      const { renamed, skipped, blocked, failed } =
+        await mineruService.migrateMarkdown(preview);
+      migrationStatus.textContent = [
+        getString("migration-result", { args: { renamed, skipped } }),
+        blocked ? getString("migration-blocked") : "",
+        failed ? getString("migration-failed") : "",
+        renamed && preview.sync.data ? getString("migration-upload") : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+    } catch (error) {
+      Zotero.logError(error as Error);
+      migrationStatus.textContent = getString("migration-failed");
+    } finally {
+      migrationButton.removeAttribute("disabled");
+      migrationInProgress = false;
+    }
+  });
   button("runtime-choose", async () => {
     const path = await new ztoolkit.FilePicker(
       getString("pref-runtime"),

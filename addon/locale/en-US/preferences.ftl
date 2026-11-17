@@ -15,3 +15,4 @@ pref-pages = Page range
 pref-pages-help = MinerU syntax: all, 1-5, or r1. Defaults are read when a queued task starts; explicit agent options take precedence.
 pref-queue-limit = Queue limit (pending tasks)
 pref-queue-limit-help = Default 10, excluding the current task. Use an integer from 1 to 2147483647 (Zotero's integer preference range). Lowering the limit never discards queued tasks; new submissions must fit the remaining capacity.
+pref-migrate-markdown = Rename existing Markdown attachments…
