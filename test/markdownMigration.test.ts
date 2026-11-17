@@ -1,10 +1,19 @@
 import { assert } from "chai";
+import { previewLegacyMarkdownMigration } from "../src/modules/mineru/markdownMigration";
 import { MineruTaskService } from "../src/modules/mineru/service";
 
 describe("MinerU Markdown filename migration", function () {
   this.timeout(20000);
 
-  it("recovers an interrupted move and renames only eligible personal results", async function () {
+  it("recovers interrupted moves and renames safe personal results with the conflict first", function () {
+    return testMigration("first");
+  });
+
+  it("recovers interrupted moves and renames safe personal results with the conflict last", function () {
+    return testMigration("last");
+  });
+
+  async function testMigration(conflictPosition: "first" | "last") {
     const temp = Zotero.getTempDirectory();
     temp.append("mineru-rename-test");
     temp.createUnique(Components.interfaces.nsIFile.DIRECTORY_TYPE, 0o700);
@@ -62,6 +71,8 @@ describe("MinerU Markdown filename migration", function () {
     const service = new MineruTaskService({
       storageRoot: PathUtils.join(temp.path, "queue"),
     });
+    const storagePref = "sync.storage.enabled";
+    const previousStoragePref = Zotero.Prefs.get(storagePref);
     try {
       const source = await importPDF(Zotero.Libraries.userLibraryID);
       const legacy = await oldAttachment(source);
@@ -103,6 +114,132 @@ describe("MinerU Markdown filename migration", function () {
       );
 
       await service.initialize();
+      assert.isFalse(await IOUtils.exists(journal));
+      for (const { item, dir } of [legacy, interrupted]) {
+        assert.equal(
+          await item.getFilePathAsync(),
+          PathUtils.join(dir, "markdown.md"),
+        );
+        assert.isFalse(await IOUtils.exists(PathUtils.join(dir, filename)));
+      }
+      // Exercise the real sync state machine without supplying real credentials.
+      Zotero.Sync.Runner.apiKey = "test-only-no-network";
+      Zotero.Prefs.set(storagePref, true);
+      source.synced = true;
+      source.attachmentSyncState = "in_sync";
+      await source.saveTx({ skipNotifier: true });
+      const baseline = Date.now();
+      for (const { item, dir } of [legacy, interrupted]) {
+        const path = PathUtils.join(dir, "markdown.md");
+        await IOUtils.setModificationTime(path, baseline);
+        item.attachmentSyncedModificationTime = (
+          await IOUtils.stat(path)
+        ).lastModified;
+        item.attachmentSyncedHash = (await item.attachmentHash)!;
+        item.attachmentSyncState = "in_sync";
+        item.synced = true;
+        await item.saveTx({ skipNotifier: true });
+      }
+      const syncedHash = legacy.item.attachmentSyncedHash;
+      const syncedTime = legacy.item.attachmentSyncedModificationTime;
+      const originalPreview = await previewLegacyMarkdownMigration();
+      assert.isFalse(originalPreview.blocked);
+      assert.equal(originalPreview.skippedSync, 0);
+      assert.deepEqual(
+        originalPreview.candidates.map(({ id }) => id).sort(),
+        [legacy.item.id, interrupted.item.id].sort(),
+      );
+      assert.equal(originalPreview.skipped, 2);
+
+      const runner = Zotero.Sync.Runner;
+      const syncState = Object.getOwnPropertyDescriptor(
+        runner,
+        "syncInProgress",
+      )!;
+      Object.defineProperty(runner, "syncInProgress", { get: () => true });
+      try {
+        const activePreview = await previewLegacyMarkdownMigration();
+        assert.isTrue(activePreview.blocked);
+        assert.deepEqual(activePreview.candidates, []);
+        assert.deepEqual(await service.migrateMarkdown(originalPreview), {
+          renamed: 0,
+          skipped: 2,
+          skippedSync: 0,
+          blocked: true,
+          failed: false,
+        });
+      } finally {
+        Object.defineProperty(runner, "syncInProgress", syncState);
+      }
+
+      // A candidate can enter conflict while the confirmation dialog is open.
+      legacy.item.attachmentSyncState = "in_conflict";
+      await legacy.item.saveTx({ skipAll: true });
+      const conflictState = legacy.item.attachmentSyncState;
+      const freshPreview = await previewLegacyMarkdownMigration();
+      assert.isFalse(freshPreview.blocked);
+      assert.equal(freshPreview.skippedSync, 1);
+      assert.deepEqual(
+        freshPreview.candidates.map(({ id }) => id),
+        [interrupted.item.id],
+      );
+      const [conflicted, safe] = [legacy, interrupted].map(
+        ({ item }) =>
+          originalPreview.candidates.find(({ id }) => id === item.id)!,
+      );
+      assert.deepEqual(
+        await service.migrateMarkdown({
+          ...originalPreview,
+          candidates:
+            conflictPosition === "first"
+              ? [conflicted, safe]
+              : [safe, conflicted],
+        }),
+        {
+          renamed: 1,
+          skipped: 2,
+          skippedSync: 1,
+          blocked: false,
+          failed: false,
+        },
+      );
+      assert.equal(legacy.item.attachmentSyncState, conflictState);
+      assert.equal(
+        await legacy.item.getFilePathAsync(),
+        PathUtils.join(legacy.dir, "markdown.md"),
+      );
+      assert.isFalse(
+        await IOUtils.exists(PathUtils.join(legacy.dir, filename)),
+      );
+      assert.equal(
+        await interrupted.item.getFilePathAsync(),
+        PathUtils.join(interrupted.dir, filename),
+      );
+      legacy.item.attachmentSyncState = "in_sync";
+      await legacy.item.saveTx({ skipAll: true });
+
+      const plan = await previewLegacyMarkdownMigration();
+      const renamed = await service.migrateMarkdown(plan);
+      assert.deepEqual(renamed, {
+        renamed: 1,
+        skipped: 2,
+        skippedSync: 0,
+        blocked: false,
+        failed: false,
+      });
+      assert.equal(legacy.item.attachmentSyncState, 0, "queued as to_upload");
+      assert.equal(legacy.item.attachmentSyncedHash, syncedHash);
+      assert.equal(legacy.item.attachmentSyncedModificationTime, syncedTime);
+      const delta = Math.abs(
+        Math.floor((await legacy.item.attachmentModificationTime)! / 1000) -
+          Math.floor(syncedTime / 1000),
+      );
+      assert.notInclude(
+        [0, 3600],
+        delta,
+        "Zotero must not treat the old ZIP as current",
+      );
+      assert.deepEqual((await previewLegacyMarkdownMigration()).candidates, []);
 
       for (const { item, dir } of [legacy, interrupted]) {
         assert.equal(
@@ -147,11 +284,13 @@ describe("MinerU Markdown filename migration", function () {
         "existing",
       );
     } finally {
+      Zotero.Sync.Runner.apiKey = "";
+      Zotero.Prefs.set(storagePref, previousStoragePref);
       await service.shutdown();
       await IOUtils.remove(journal, { ignoreAbsent: true });
       for (const item of items.reverse()) await item.eraseTx();
       await group.eraseTx();
       temp.remove(true);
     }
-  });
+  }
 });

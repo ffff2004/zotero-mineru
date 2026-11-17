@@ -1,3 +1,4 @@
+import { previewLegacyMarkdownMigration } from "../src/modules/mineru/markdownMigration";
 import { assert } from "chai";
 import { config } from "../package.json";
 import manifest from "../runtime/release.json";
@@ -445,6 +446,15 @@ describe("MinerU shared task service and local HTTP API", function () {
       await f.service.shutdown();
       restarted = new MineruTaskService({ storageRoot: f.storageRoot });
       await restarted.initialize();
+
+      assert.equal(
+        PathUtils.filename(restarted.get(task.taskID).result!.paths.markdown!),
+        "markdown.md",
+      );
+      const migration = await restarted.migrateMarkdown(
+        await previewLegacyMarkdownMigration(),
+      );
+      assert.equal(migration.renamed, 1);
 
       const saved = restarted.get(task.taskID).result!;
       assert.equal(saved.itemKey, task.result!.itemKey);

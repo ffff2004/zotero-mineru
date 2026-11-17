@@ -15,3 +15,4 @@ pref-pages = 页范围
 pref-pages-help = MinerU 语法：all、1-5 或 r1。排队任务开始时读取默认值；agent 的显式参数优先。
 pref-queue-limit = 队列上限（待执行任务）
 pref-queue-limit-help = 默认 10，不含当前任务。请输入 1–2147483647 的整数（Zotero 整数偏好设置支持的范围）。调低上限不删除已有任务；新提交必须符合剩余容量。
+pref-migrate-markdown = 重命名已有的 Markdown 附件…
