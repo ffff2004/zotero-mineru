@@ -116,6 +116,8 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
   };
   const migrationButton = doc.getElementById("mineru-migrate-markdown");
   const migrationStatus = doc.getElementById("mineru-migration-status");
+  const syncSkipped = (count: number) =>
+    count ? getString("migration-skipped-sync", { args: { count } }) : "";
   button("migrate-markdown", async () => {
     if (!migrationButton || !migrationStatus || migrationInProgress) return;
     migrationInProgress = true;
@@ -128,22 +130,38 @@ export async function registerPrefsScripts(win: Window): Promise<void> {
         return;
       }
       if (!preview.candidates.length) {
-        migrationStatus.textContent = getString("migration-empty", {
-          args: { skipped: preview.skipped },
-        });
+        migrationStatus.textContent = [
+          getString("migration-empty", {
+            args: { skipped: preview.skipped + preview.skippedSync },
+          }),
+          syncSkipped(preview.skippedSync),
+        ]
+          .filter(Boolean)
+          .join(" ");
         return;
       }
-      const confirmation = getString("migration-confirm", {
-        args: { count: preview.candidates.length, skipped: preview.skipped },
-      });
+      const confirmation = [
+        getString("migration-confirm", {
+          args: {
+            count: preview.candidates.length,
+            skipped: preview.skipped + preview.skippedSync,
+          },
+        }),
+        syncSkipped(preview.skippedSync),
+      ]
+        .filter(Boolean)
+        .join(" ");
       const message = preview.sync.data
         ? `${confirmation}\n\n${getString("migration-sync-confirm")}`
         : confirmation;
       if (!win.confirm(message)) return;
-      const { renamed, skipped, blocked, failed } =
+      const { renamed, skipped, skippedSync, blocked, failed } =
         await mineruService.migrateMarkdown(preview);
       migrationStatus.textContent = [
-        getString("migration-result", { args: { renamed, skipped } }),
+        getString("migration-result", {
+          args: { renamed, skipped: skipped + skippedSync },
+        }),
+        syncSkipped(skippedSync),
         blocked ? getString("migration-blocked") : "",
         failed ? getString("migration-failed") : "",
         renamed && preview.sync.data ? getString("migration-upload") : "",

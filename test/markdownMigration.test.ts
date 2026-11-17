@@ -5,7 +5,15 @@ import { MineruTaskService } from "../src/modules/mineru/service";
 describe("MinerU Markdown filename migration", function () {
   this.timeout(20000);
 
-  it("rolls back an interrupted move at startup and only renames confirmed personal results with normal sync", async function () {
+  it("recovers interrupted moves and renames safe personal results with the conflict first", function () {
+    return testMigration("first");
+  });
+
+  it("recovers interrupted moves and renames safe personal results with the conflict last", function () {
+    return testMigration("last");
+  });
+
+  async function testMigration(conflictPosition: "first" | "last") {
     const temp = Zotero.getTempDirectory();
     temp.append("mineru-rename-test");
     temp.createUnique(Components.interfaces.nsIFile.DIRECTORY_TYPE, 0o700);
@@ -136,30 +144,86 @@ describe("MinerU Markdown filename migration", function () {
       const syncedTime = legacy.item.attachmentSyncedModificationTime;
       const originalPreview = await previewLegacyMarkdownMigration();
       assert.isFalse(originalPreview.blocked);
+      assert.equal(originalPreview.skippedSync, 0);
       assert.deepEqual(
         originalPreview.candidates.map(({ id }) => id).sort(),
         [legacy.item.id, interrupted.item.id].sort(),
       );
       assert.equal(originalPreview.skipped, 2);
 
-      // A conflict arriving after the confirmation preview must prevent migration.
+      const runner = Zotero.Sync.Runner;
+      const syncState = Object.getOwnPropertyDescriptor(
+        runner,
+        "syncInProgress",
+      )!;
+      Object.defineProperty(runner, "syncInProgress", { get: () => true });
+      try {
+        const activePreview = await previewLegacyMarkdownMigration();
+        assert.isTrue(activePreview.blocked);
+        assert.deepEqual(activePreview.candidates, []);
+        assert.deepEqual(await service.migrateMarkdown(originalPreview), {
+          renamed: 0,
+          skipped: 2,
+          skippedSync: 0,
+          blocked: true,
+          failed: false,
+        });
+      } finally {
+        Object.defineProperty(runner, "syncInProgress", syncState);
+      }
+
+      // A candidate can enter conflict while the confirmation dialog is open.
       legacy.item.attachmentSyncState = "in_conflict";
       await legacy.item.saveTx({ skipAll: true });
-      assert.isTrue((await previewLegacyMarkdownMigration()).blocked);
-      assert.deepEqual(await service.migrateMarkdown(originalPreview), {
-        renamed: 0,
-        skipped: 2,
-        blocked: true,
-        failed: false,
-      });
+      const conflictState = legacy.item.attachmentSyncState;
+      const freshPreview = await previewLegacyMarkdownMigration();
+      assert.isFalse(freshPreview.blocked);
+      assert.equal(freshPreview.skippedSync, 1);
+      assert.deepEqual(
+        freshPreview.candidates.map(({ id }) => id),
+        [interrupted.item.id],
+      );
+      const [conflicted, safe] = [legacy, interrupted].map(
+        ({ item }) =>
+          originalPreview.candidates.find(({ id }) => id === item.id)!,
+      );
+      assert.deepEqual(
+        await service.migrateMarkdown({
+          ...originalPreview,
+          candidates:
+            conflictPosition === "first"
+              ? [conflicted, safe]
+              : [safe, conflicted],
+        }),
+        {
+          renamed: 1,
+          skipped: 2,
+          skippedSync: 1,
+          blocked: false,
+          failed: false,
+        },
+      );
+      assert.equal(legacy.item.attachmentSyncState, conflictState);
+      assert.equal(
+        await legacy.item.getFilePathAsync(),
+        PathUtils.join(legacy.dir, "markdown.md"),
+      );
+      assert.isFalse(
+        await IOUtils.exists(PathUtils.join(legacy.dir, filename)),
+      );
+      assert.equal(
+        await interrupted.item.getFilePathAsync(),
+        PathUtils.join(interrupted.dir, filename),
+      );
       legacy.item.attachmentSyncState = "in_sync";
       await legacy.item.saveTx({ skipAll: true });
 
       const plan = await previewLegacyMarkdownMigration();
       const renamed = await service.migrateMarkdown(plan);
       assert.deepEqual(renamed, {
-        renamed: 2,
+        renamed: 1,
         skipped: 2,
+        skippedSync: 0,
         blocked: false,
         failed: false,
       });
@@ -228,5 +292,5 @@ describe("MinerU Markdown filename migration", function () {
       await group.eraseTx();
       temp.remove(true);
     }
-  });
+  }
 });

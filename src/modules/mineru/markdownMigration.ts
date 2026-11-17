@@ -188,8 +188,8 @@ export async function previewLegacyMarkdownMigration() {
   const sync = syncSettings();
   const candidates: Candidate[] = [];
   let skipped = 0;
-  let blocked = sync.active;
-  if (library.editable && library.filesEditable) {
+  let skippedSync = 0;
+  if (!sync.active && library.editable && library.filesEditable) {
     const ids = await Zotero.DB.columnQueryAsync<number>(
       `SELECT itemID FROM itemAttachments JOIN items USING (itemID)
        WHERE libraryID = ? AND contentType = 'text/markdown' AND path = ?`,
@@ -205,7 +205,10 @@ export async function previewLegacyMarkdownMigration() {
         skipped++;
         continue;
       }
-      if (await syncPending(item, match, sync)) blocked = true;
+      if (await syncPending(item, match, sync)) {
+        skippedSync++;
+        continue;
+      }
       candidates.push({
         id,
         key: item.key,
@@ -217,7 +220,8 @@ export async function previewLegacyMarkdownMigration() {
   return {
     candidates,
     skipped,
-    blocked: blocked || syncSettings().active,
+    skippedSync,
+    blocked: sync.active || syncChanged(sync),
     sync,
   };
 }
@@ -226,12 +230,10 @@ export type MarkdownMigrationPreview = Awaited<
   ReturnType<typeof previewLegacyMarkdownMigration>
 >;
 
-function syncChanged(preview: MarkdownMigrationPreview) {
+function syncChanged(previous: ReturnType<typeof syncSettings>) {
   const sync = syncSettings();
   return (
-    sync.active ||
-    sync.data !== preview.sync.data ||
-    sync.files !== preview.sync.files
+    sync.active || sync.data !== previous.data || sync.files !== previous.files
   );
 }
 
@@ -255,7 +257,8 @@ async function markFileForUpload(item: Zotero.Item, target: string) {
 export async function migrateLegacyMarkdown(preview: MarkdownMigrationPreview) {
   let renamed = 0;
   let skipped = preview.skipped;
-  let blocked = preview.blocked || syncChanged(preview);
+  let skippedSync = preview.skippedSync;
+  let blocked = preview.blocked || syncChanged(preview.sync);
   let failed = false;
   const journal = journalPath();
   if (!blocked && occupied(journal)) {
@@ -263,7 +266,7 @@ export async function migrateLegacyMarkdown(preview: MarkdownMigrationPreview) {
     await recoverLegacyMarkdownRename();
   }
   for (const entry of preview.candidates) {
-    if (blocked || syncChanged(preview)) {
+    if (blocked || syncChanged(preview.sync)) {
       blocked = true;
       break;
     }
@@ -282,10 +285,6 @@ export async function migrateLegacyMarkdown(preview: MarkdownMigrationPreview) {
       skipped++;
       continue;
     }
-    if (await syncPending(item, match, preview.sync)) {
-      blocked = true;
-      break;
-    }
     try {
       const record: Rename = {
         key: entry.key,
@@ -294,26 +293,23 @@ export async function migrateLegacyMarkdown(preview: MarkdownMigrationPreview) {
         sha256: await IOUtils.computeHexDigest(match.original, "sha256"),
         mtime: (await IOUtils.stat(match.original)).lastModified,
       };
-      await IOUtils.writeUTF8(journal, JSON.stringify(record), {
-        tmpPath: `${journal}.tmp`,
-        flush: true,
-      });
       // The transaction serializes the Zotero path update against incoming
       // data sync. Never start a move while the native sync runner is active.
-      await Zotero.DB.executeTransaction(async () => {
-        if (syncChanged(preview)) {
-          blocked = true;
-          return;
-        }
+      const outcome = await Zotero.DB.executeTransaction(async () => {
+        if (syncChanged(preview.sync)) return "blocked";
+        const pending = await syncPending(item, match, preview.sync);
+        if (syncChanged(preview.sync)) return "blocked";
+        if (pending) return "skipped-sync";
+        await IOUtils.writeUTF8(journal, JSON.stringify(record), {
+          tmpPath: `${journal}.tmp`,
+          flush: true,
+        });
         if (
           (await IOUtils.computeHexDigest(match.original, "sha256")) !==
           record.sha256
         )
           throw new Error("Markdown changed before rename");
-        if (syncChanged(preview)) {
-          blocked = true;
-          return;
-        }
+        if (syncChanged(preview.sync)) return "blocked";
         await IOUtils.move(match.original, match.target, { noOverwrite: true });
         await markFileForUpload(item, match.target);
         item.attachmentFilename = entry.filename;
@@ -321,10 +317,18 @@ export async function migrateLegacyMarkdown(preview: MarkdownMigrationPreview) {
           skipDateModifiedUpdate: true,
           notifierData: { skipAutoSync: true },
         });
+        return "renamed";
       });
-      if (!blocked) renamed++;
-      await IOUtils.remove(journal);
-      if (blocked) break;
+      if (outcome === "renamed") renamed++;
+      if (outcome === "skipped-sync") {
+        skippedSync++;
+        continue;
+      }
+      await IOUtils.remove(journal, { ignoreAbsent: true });
+      if (outcome === "blocked") {
+        blocked = true;
+        break;
+      }
     } catch (error) {
       Zotero.logError(error as Error);
       await recoverLegacyMarkdownRename().catch((recoveryError) =>
@@ -334,5 +338,5 @@ export async function migrateLegacyMarkdown(preview: MarkdownMigrationPreview) {
       break;
     }
   }
-  return { renamed, skipped, blocked, failed };
+  return { renamed, skipped, skippedSync, blocked, failed };
 }

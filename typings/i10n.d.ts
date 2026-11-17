@@ -22,6 +22,7 @@ export type FluentMessageId =
   | 'migration-empty'
   | 'migration-failed'
   | 'migration-result'
+  | 'migration-skipped-sync'
   | 'migration-sync-confirm'
   | 'migration-upload'
   | 'open-configuration'
